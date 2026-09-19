@@ -57,6 +57,23 @@ class AgentName(StrEnum):
     CONVERSE = "converse"
 
 
+class ToneEnum(StrEnum):
+    PROFESSIONAL = "professional"
+    CASUAL = "casual"
+    CONSULTATIVE = "consultative"
+    DIRECT = "direct"
+    FRIENDLY = "friendly"
+    EXECUTIVE = "executive"
+
+
+class AssetType(StrEnum):
+    IMAGE = "image"
+    PDF = "pdf"
+    VIDEO = "video"
+    LINK = "link"
+    CASE_STUDY = "case_study"
+
+
 class DecisionVerdict(StrEnum):
     QUALIFY = "qualify"
     REJECT = "reject"
@@ -76,5 +93,7 @@ __all__ = [
     "CampaignStatus",
     "AgentName",
     "DecisionVerdict",
+    "ToneEnum",
+    "AssetType",
     "_new_id",
 ]

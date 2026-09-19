@@ -46,6 +46,7 @@ class CampaignProspectLink(TimestampedModel):
     stage: FunnelStage = FunnelStage.DISCOVERED
     fit_score: Optional[float] = None            # 0-100, set by Research agent
     qualification_reasoning: Optional[str] = None
+    persona_id: Optional[str] = None             # Persona.id, assigned by Research at qualification
 
     human_approved: bool = False
     human_approved_by: Optional[str] = None

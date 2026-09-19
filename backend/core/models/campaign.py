@@ -51,6 +51,9 @@ class Campaign(TimestampedModel):
     icp: ICPFilter = Field(default_factory=ICPFilter)
     agent_settings: dict[str, AgentSettings] = Field(default_factory=dict)   # keyed by AgentName
     channel_policies: list[ChannelPolicy] = Field(default_factory=list)
+    # Fallback channel order when a prospect's persona doesn't specify its own
+    # (see Persona.effective_channel_priority).
+    default_channel_priority: list[Channel] = Field(default_factory=list)
 
     system_prompt_version: Optional[str] = None      # campaign-level PromptVersion.id
     assigned_rep_ids: list[str] = Field(default_factory=list)
