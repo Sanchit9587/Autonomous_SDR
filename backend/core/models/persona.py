@@ -50,6 +50,10 @@ class Persona(TimestampedModel):
 
     channel_priority: list[Channel] = Field(default_factory=list)   # overrides campaign default
     templates: dict[str, MessageTemplate] = Field(default_factory=dict)  # keyed by Channel value
+    # Few-shot examples of messages that worked for this persona, keyed by Channel
+    # value, e.g. {"email": ["Hi {{first_name}}...", ...]}. Retrieved by the
+    # Personalize agent to ground free-generation when no template applies.
+    example_messages: dict[str, list[str]] = Field(default_factory=dict)
     follow_up_policy: FollowUpPolicy = Field(default_factory=FollowUpPolicy)
 
     def effective_channel_priority(self, campaign_default: list[Channel]) -> list[Channel]:

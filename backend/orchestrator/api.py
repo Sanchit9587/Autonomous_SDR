@@ -13,13 +13,19 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
 from agents.base import AgentContext
+from agents.converse.agent import ConverseAgent
+from agents.personalize.agent import PersonalizeAgent
 from agents.research.agent import ResearchAgent
 from core.models import (
     AgentDecision,
     AgentSettings,
     Campaign,
+    CampaignAsset,
     CampaignProspectLink,
+    Channel,
+    ConversationTurn,
     DecisionVerdict,
+    Direction,
     FunnelStage,
     ICPFilter,
     Persona,
@@ -28,6 +34,7 @@ from core.models import (
 from orchestrator import campaign_controller as cc
 from orchestrator import state_machine as sm
 from orchestrator.conflict_resolver import detect_cross_campaign_conflicts, find_duplicate_prospects
+from orchestrator.suppression import SuppressionList
 
 router = APIRouter(prefix="/campaigns", tags=["campaigns"])
 
@@ -36,9 +43,13 @@ _campaigns: dict[str, Campaign] = {}
 _prospects: dict[str, Prospect] = {}
 _links: dict[str, CampaignProspectLink] = {}  # keyed by link.id
 _personas: dict[str, Persona] = {}
+_assets: dict[str, CampaignAsset] = {}
 _decisions: list[AgentDecision] = []
+_conversations: list[ConversationTurn] = []
+suppression = SuppressionList()
 kill_switch = cc.GlobalKillSwitch()
 research_agent = ResearchAgent()  # zero-config default: no Apollo, template/Gemini/Groq reasoning per env
+converse_agent = ConverseAgent()
 
 
 # --- request/response payloads ---------------------------------------------
@@ -249,3 +260,122 @@ def run_research(campaign_id: str, link_id: str) -> dict:
 def get_decisions(campaign_id: str, link_id: str) -> list[AgentDecision]:
     link = _get_link(link_id)
     return [d for d in _decisions if d.campaign_id == campaign_id and d.prospect_id == link.prospect_id]
+
+
+# --- campaign assets ---------------------------------------------------------
+@router.post("/{campaign_id}/assets", response_model=CampaignAsset)
+def create_asset(campaign_id: str, asset: CampaignAsset) -> CampaignAsset:
+    _get_campaign(campaign_id)
+    asset.campaign_id = campaign_id
+    _assets[asset.id] = asset
+    return asset
+
+
+@router.get("/{campaign_id}/assets", response_model=list[CampaignAsset])
+def list_assets(campaign_id: str) -> list[CampaignAsset]:
+    _get_campaign(campaign_id)
+    return [a for a in _assets.values() if a.campaign_id == campaign_id]
+
+
+# --- personalize agent invocation --------------------------------------------
+@router.post("/{campaign_id}/prospects/{link_id}/personalize")
+def run_personalize(campaign_id: str, link_id: str) -> dict:
+    """Runs the Personalize agent on a qualified prospect. Returns a draft +
+    channel + timing decision. Does NOT send — a SEND verdict is what the
+    orchestrator would hand to a messaging connector, and a WAIT verdict's
+    scheduled_time is what an APScheduler job would later fire on. Neither the
+    connector nor the scheduler is built yet, so this endpoint stops at the
+    decision (which is the agent's whole job)."""
+    campaign = _get_campaign(campaign_id)
+    link = _get_link(link_id)
+    prospect = _prospects.get(link.prospect_id)
+    if prospect is None:
+        raise HTTPException(404, f"Prospect {link.prospect_id} not found")
+    if link.stage != FunnelStage.QUALIFIED:
+        raise HTTPException(409, f"Prospect is at stage '{link.stage}', must be 'qualified' to personalize")
+
+    campaign_personas = [p for p in _personas.values() if p.campaign_id == campaign_id]
+    campaign_assets = [a for a in _assets.values() if a.campaign_id == campaign_id]
+
+    agent = PersonalizeAgent(assets=campaign_assets)
+    context = AgentContext(campaign=campaign, prospect=prospect, link=link, personas=campaign_personas)
+    decision = agent.run(context)
+    _decisions.append(decision)
+
+    return {"decision": decision}
+
+
+# --- converse agent invocation -----------------------------------------------
+class ConverseRequest(BaseModel):
+    inbound_message: Optional[str] = None
+    trigger: str = "reply"                 # "reply" | "follow_up"
+    channel: Channel = Channel.EMAIL
+
+
+@router.post("/{campaign_id}/prospects/{link_id}/converse")
+def run_converse(campaign_id: str, link_id: str, body: ConverseRequest) -> dict:
+    """Handle an inbound reply (from a channel connector, later) or a fired
+    follow-up timer (from APScheduler, later). Today the inbound message is
+    passed in the request body so it's testable without a live inbox.
+
+    Applies the returned decision: records the inbound turn, transitions stage,
+    suppresses on unsubscribe, and — when a reply is needed — re-invokes the
+    Personalize agent (all drafting lives there)."""
+    campaign = _get_campaign(campaign_id)
+    link = _get_link(link_id)
+    prospect = _prospects.get(link.prospect_id)
+    if prospect is None:
+        raise HTTPException(404, f"Prospect {link.prospect_id} not found")
+
+    campaign_personas = [p for p in _personas.values() if p.campaign_id == campaign_id]
+    history = [t for t in _conversations if t.campaign_id == campaign_id and t.prospect_id == link.prospect_id]
+
+    # Record the inbound reply as a conversation turn.
+    if body.trigger == "reply" and body.inbound_message:
+        _conversations.append(ConversationTurn(
+            campaign_id=campaign_id, prospect_id=link.prospect_id,
+            channel=body.channel, direction=Direction.INBOUND, content=body.inbound_message,
+        ))
+
+    context = AgentContext(
+        campaign=campaign, prospect=prospect, link=link, personas=campaign_personas,
+        trigger=body.trigger, inbound_message=body.inbound_message, conversation_history=history,
+    )
+    decision = converse_agent.run(context)
+    _decisions.append(decision)
+
+    # --- orchestrator executes the decision ---
+    follow_up_draft = None
+
+    if decision.details.get("suppress"):
+        suppression.add_prospect(prospect)
+
+    target_stage = decision.details.get("target_stage")
+    if target_stage:
+        try:
+            sm.transition(link, FunnelStage(target_stage), campaign)
+        except (sm.InvalidTransitionError, sm.CampaignNotLiveError):
+            pass  # keep current stage if the transition isn't valid from here
+
+    # Loop-back: when a reply/follow-up message is needed, re-invoke Personalize.
+    next_action = decision.details.get("next_action")
+    if next_action in ("reply", "follow_up") and link.stage == FunnelStage.ENGAGED:
+        campaign_assets = [a for a in _assets.values() if a.campaign_id == campaign_id]
+        p_agent = PersonalizeAgent(assets=campaign_assets)
+        p_decision = p_agent.run(context)
+        _decisions.append(p_decision)
+        follow_up_draft = p_decision
+
+    return {"decision": decision, "personalize_followup": follow_up_draft}
+
+
+# --- suppression / do-not-contact --------------------------------------------
+@router.get("/suppression/list")
+def get_suppression_list() -> dict:
+    return {"suppressed": suppression.all()}
+
+
+@router.post("/suppression/add")
+def add_to_suppression(value: str) -> dict:
+    suppression.add(value)
+    return {"added": value}

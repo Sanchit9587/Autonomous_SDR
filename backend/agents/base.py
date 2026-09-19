@@ -10,7 +10,7 @@ from typing import Optional
 
 from pydantic import BaseModel, ConfigDict
 
-from core.models import AgentDecision, Campaign, CampaignProspectLink, Persona, Prospect
+from core.models import AgentDecision, Campaign, CampaignProspectLink, ConversationTurn, Persona, Prospect
 
 
 class AgentContext(BaseModel):
@@ -24,6 +24,11 @@ class AgentContext(BaseModel):
     link: CampaignProspectLink
     personas: list[Persona] = []
     prompt_version_id: Optional[str] = None
+
+    # Converse-specific (optional; unused by Research/Personalize):
+    trigger: Optional[str] = None                 # "reply" | "follow_up"
+    inbound_message: Optional[str] = None         # the raw reply text, when trigger == "reply"
+    conversation_history: list[ConversationTurn] = []
 
 
 class Agent(ABC):
