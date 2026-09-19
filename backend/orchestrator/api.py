@@ -12,7 +12,19 @@ from typing import Optional
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
-from core.models import Campaign, CampaignProspectLink, FunnelStage, ICPFilter, Prospect
+from agents.base import AgentContext
+from agents.research.agent import ResearchAgent
+from core.models import (
+    AgentDecision,
+    AgentSettings,
+    Campaign,
+    CampaignProspectLink,
+    DecisionVerdict,
+    FunnelStage,
+    ICPFilter,
+    Persona,
+    Prospect,
+)
 from orchestrator import campaign_controller as cc
 from orchestrator import state_machine as sm
 from orchestrator.conflict_resolver import detect_cross_campaign_conflicts, find_duplicate_prospects
@@ -23,7 +35,10 @@ router = APIRouter(prefix="/campaigns", tags=["campaigns"])
 _campaigns: dict[str, Campaign] = {}
 _prospects: dict[str, Prospect] = {}
 _links: dict[str, CampaignProspectLink] = {}  # keyed by link.id
+_personas: dict[str, Persona] = {}
+_decisions: list[AgentDecision] = []
 kill_switch = cc.GlobalKillSwitch()
+research_agent = ResearchAgent()  # zero-config default: no Apollo, template/Gemini/Groq reasoning per env
 
 
 # --- request/response payloads ---------------------------------------------
@@ -32,6 +47,8 @@ class CreateCampaignRequest(BaseModel):
     owner: str
     description: Optional[str] = None
     icp: ICPFilter = ICPFilter()
+    agent_settings: dict[str, AgentSettings] = {}
+    default_channel_priority: list = []
 
 
 class TransitionRequest(BaseModel):
@@ -56,7 +73,10 @@ def _get_link(link_id: str) -> CampaignProspectLink:
 # --- campaign lifecycle ------------------------------------------------------
 @router.post("", response_model=Campaign)
 def create_campaign(body: CreateCampaignRequest) -> Campaign:
-    campaign = Campaign(name=body.name, owner=body.owner, description=body.description, icp=body.icp)
+    campaign = Campaign(
+        name=body.name, owner=body.owner, description=body.description, icp=body.icp,
+        agent_settings=body.agent_settings, default_channel_priority=body.default_channel_priority,
+    )
     _campaigns[campaign.id] = campaign
     return campaign
 
@@ -172,3 +192,60 @@ def get_cross_campaign_conflicts() -> list[dict]:
         {"prospect_id": c.prospect_id, "campaign_ids": c.campaign_ids, "reason": c.reason}
         for c in conflicts
     ]
+
+
+# --- personas ----------------------------------------------------------------
+@router.post("/{campaign_id}/personas", response_model=Persona)
+def create_persona(campaign_id: str, persona: Persona) -> Persona:
+    _get_campaign(campaign_id)
+    persona.campaign_id = campaign_id
+    _personas[persona.id] = persona
+    return persona
+
+
+@router.get("/{campaign_id}/personas", response_model=list[Persona])
+def list_personas(campaign_id: str) -> list[Persona]:
+    _get_campaign(campaign_id)
+    return [p for p in _personas.values() if p.campaign_id == campaign_id]
+
+
+# --- research agent invocation ------------------------------------------------
+@router.post("/{campaign_id}/prospects/{link_id}/research")
+def run_research(campaign_id: str, link_id: str) -> dict:
+    """Runs the Research agent on one prospect and applies its decision via
+    the state machine. This is the orchestrator's job, not the agent's — the
+    agent only returns an AgentDecision, this endpoint is what actually calls
+    sm.transition() based on the verdict (agents decide, orchestrator executes)."""
+    campaign = _get_campaign(campaign_id)
+    link = _get_link(link_id)
+    prospect = _prospects.get(link.prospect_id)
+    if prospect is None:
+        raise HTTPException(404, f"Prospect {link.prospect_id} not found")
+
+    campaign_personas = [p for p in _personas.values() if p.campaign_id == campaign_id]
+    context = AgentContext(campaign=campaign, prospect=prospect, link=link, personas=campaign_personas)
+    decision = research_agent.run(context)
+    _decisions.append(decision)
+
+    # Advance Discovered -> Researched first, if not already past it.
+    if link.stage == FunnelStage.DISCOVERED:
+        sm.transition(link, FunnelStage.RESEARCHED, campaign)
+
+    link.fit_score = decision.details.get("fit_score")
+    link.qualification_reasoning = decision.reasoning
+    if decision.details.get("persona_id"):
+        link.persona_id = decision.details["persona_id"]
+
+    if decision.verdict == DecisionVerdict.QUALIFY:
+        sm.transition(link, FunnelStage.QUALIFIED, campaign)
+    elif decision.verdict == DecisionVerdict.REJECT:
+        sm.transition(link, FunnelStage.REJECTED, campaign)
+    # NEEDS_REVIEW: stays at RESEARCHED, awaiting the human-approval gate.
+
+    return {"link": link, "decision": decision}
+
+
+@router.get("/{campaign_id}/prospects/{link_id}/decisions", response_model=list[AgentDecision])
+def get_decisions(campaign_id: str, link_id: str) -> list[AgentDecision]:
+    link = _get_link(link_id)
+    return [d for d in _decisions if d.campaign_id == campaign_id and d.prospect_id == link.prospect_id]
