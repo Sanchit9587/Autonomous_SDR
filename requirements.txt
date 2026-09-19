@@ -18,6 +18,12 @@ numpy>=1.26
 # Commented out by default since it pulls in torch (large download) — uncomment if you switch backends.
 # sentence-transformers>=3.0
 
+# Database: Prisma Postgres via SQLAlchemy (async runtime + Alembic migrations)
+sqlalchemy[asyncio]>=2.0
+asyncpg>=0.29         # async driver, used by the running app (pooled DATABASE_URL)
+psycopg2-binary>=2.9  # sync driver, used by Alembic migrations (DIRECT_URL)
+alembic>=1.13
+
 # Testing
 pytest>=8.0
 pytest-cov>=5.0
