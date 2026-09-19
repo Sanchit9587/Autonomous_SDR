@@ -1,0 +1,23 @@
+# Core pipeline
+httpx>=0.27
+pydantic>=2.7
+mcp>=2.0            # provides mcp.server.mcpserver.MCPServer (1.x FastMCP also supported)
+python-dotenv>=1.0
+# NOTE: 'asyncio' is part of the Python standard library (3.4+). Do NOT pip install it —
+# the PyPI 'asyncio' package is an obsolete backport that breaks modern installs.
+
+# Optional: only needed to receive Apollo async phone-number webhooks
+fastapi>=0.110
+uvicorn>=0.29
+
+# Research agent: RAG retriever (TF-IDF default backend) + scoring
+scikit-learn>=1.4
+numpy>=1.26
+# Optional upgrade: set RESEARCH_EMBEDDING_BACKEND=sentence_transformers to use this
+# instead of TF-IDF (better semantic quality, downloads a ~90MB CPU model on first use).
+# Commented out by default since it pulls in torch (large download) — uncomment if you switch backends.
+# sentence-transformers>=3.0
+
+# Testing
+pytest>=8.0
+pytest-cov>=5.0
