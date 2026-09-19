@@ -1,0 +1,23 @@
+{
+  "name": "sdr-voice-sms-agent",
+  "version": "1.0.0",
+  "description": "Voice + SMS outreach channel for the Autonomous SDR buildathon build, using DronaHQ Agentic AI + Twilio.",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "node --watch src/server.js",
+    "seed": "node scripts/seedLeads.js",
+    "test:sms": "node scripts/testSms.js",
+    "test:voice": "node scripts/testVoice.js"
+  },
+  "dependencies": {
+    "axios": "^1.7.7",
+    "body-parser": "^1.20.3",
+    "csv-parse": "^5.5.6",
+    "dotenv": "^16.4.5",
+    "express": "^4.21.0",
+    "morgan": "^1.10.0",
+    "twilio": "^5.3.4",
+    "uuid": "^9.0.1"
+  }
+}

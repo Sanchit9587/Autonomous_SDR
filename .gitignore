@@ -1,5 +1,4 @@
-venv/
-backend/.env
-backend/alembic/__pycache__/
-backend/core/db/__pycache__/
-backend/alembic/versions/__pycache__/
+node_modules/
+.env
+*.log
+data/state.json
