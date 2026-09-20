@@ -10,6 +10,12 @@ export interface CampaignOverview {
   campaign: Campaign;
   funnel: FunnelCounts;
   open_escalations: number;
+  total_spend: number;
+  opportunities: number;
+  deals_with_value: number;
+  avg_deal_value: number | null;
+  cac: number | null;
+  ltv_cac_ratio: number | null;
 }
 
 export const repApi = {

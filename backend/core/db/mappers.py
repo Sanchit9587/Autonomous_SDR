@@ -68,7 +68,7 @@ def link_to_orm(m: CampaignProspectLink) -> t.CampaignProspectLinkORM:
         fit_score=m.fit_score, qualification_reasoning=m.qualification_reasoning, persona_id=m.persona_id,
         human_approved=m.human_approved, human_approved_by=m.human_approved_by,
         last_contacted_channel=m.last_contacted_channel, contact_count=m.contact_count,
-        follow_up_owed=m.follow_up_owed, next_follow_up_at=m.next_follow_up_at,
+        follow_up_owed=m.follow_up_owed, next_follow_up_at=m.next_follow_up_at, deal_value=m.deal_value,
         created_at=m.created_at, updated_at=m.updated_at,
     )
 
@@ -79,7 +79,7 @@ def link_to_model(o: t.CampaignProspectLinkORM) -> CampaignProspectLink:
         "fit_score": o.fit_score, "qualification_reasoning": o.qualification_reasoning, "persona_id": o.persona_id,
         "human_approved": o.human_approved, "human_approved_by": o.human_approved_by,
         "last_contacted_channel": o.last_contacted_channel, "contact_count": o.contact_count,
-        "follow_up_owed": o.follow_up_owed, "next_follow_up_at": o.next_follow_up_at,
+        "follow_up_owed": o.follow_up_owed, "next_follow_up_at": o.next_follow_up_at, "deal_value": o.deal_value,
         "created_at": o.created_at, "updated_at": o.updated_at,
     })
 

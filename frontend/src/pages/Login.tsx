@@ -18,7 +18,7 @@ export function Login() {
     try {
       const user = await login(email, password);
       // Managers → control plane; reps → operational app.
-      navigate(user.role === "rep" ? "/rep" : "/campaigns");
+      navigate(user.role === "rep" ? "/rep" : "/dashboard");
     } catch (e) {
       setError(e instanceof ApiError ? e.message : "Login failed");
     } finally {

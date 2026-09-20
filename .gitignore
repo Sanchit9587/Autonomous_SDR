@@ -16,3 +16,4 @@ backend/rag/__pycache__/
 backend/scripts/__pycache__/
 frontend/node_modules/
 frontend/.env
+backend/discovery/__pycache__/

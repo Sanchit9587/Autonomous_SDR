@@ -19,6 +19,7 @@ from core.db.engine import get_session
 from core.models import AgentDecision, Campaign, CampaignProspectLink, Prospect, User
 from core.models.base import UserRole
 from orchestrator import state_machine as sm
+from orchestrator.economics import compute_campaign_economics
 
 router = APIRouter(prefix="/rep", tags=["rep"], dependencies=[Depends(get_current_user)])
 
@@ -40,6 +41,12 @@ class CampaignOverview(BaseModel):
     campaign: Campaign
     funnel: dict[str, int]
     open_escalations: int
+    total_spend: float
+    opportunities: int
+    deals_with_value: int
+    avg_deal_value: Optional[float] = None
+    cac: Optional[float] = None
+    ltv_cac_ratio: Optional[float] = None
 
 
 @router.get("/campaigns", response_model=list[Campaign])
@@ -56,7 +63,13 @@ async def rep_campaign_overview(campaign_id: str, user: User = Depends(get_curre
         raise HTTPException(404, "Campaign not found")
     links = await repo.list_links_for_campaign(session, campaign_id)
     escalations = await repo.list_escalations(session, campaign_id)
-    return CampaignOverview(campaign=campaign, funnel=sm.funnel_counts(links), open_escalations=len(escalations))
+    touches = await repo.count_touches_total(session, campaign_id)
+    econ = compute_campaign_economics(campaign.channel_policies, touches, links)
+    return CampaignOverview(
+        campaign=campaign, funnel=sm.funnel_counts(links), open_escalations=len(escalations),
+        total_spend=econ.total_spend, opportunities=econ.opportunities, deals_with_value=econ.deals_with_value,
+        avg_deal_value=econ.avg_deal_value, cac=econ.cac, ltv_cac_ratio=econ.ltv_cac_ratio,
+    )
 
 
 @router.get("/campaigns/{campaign_id}/prospects", response_model=list[ProspectRow])
