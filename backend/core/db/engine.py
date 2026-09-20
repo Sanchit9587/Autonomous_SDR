@@ -16,11 +16,9 @@ from urllib.parse import parse_qs, urlencode, urlsplit, urlunsplit
 
 from dotenv import load_dotenv
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.pool import NullPool
 
 # Load .env HERE, at module import, before any code below reads os.getenv().
-# This module builds the engine at import time, and it may be imported before
-# an app entrypoint gets a chance to call load_dotenv() — so it must not depend
-# on someone else having loaded the env first.
 load_dotenv()
 
 
@@ -56,13 +54,11 @@ def get_database_url() -> str:
     return _to_asyncpg_url(url)
 
 
-# Build the engine from the real URL. If DATABASE_URL is missing, get_database_url()
-# raises a clear error naming the problem — far better than silently connecting to a
-# fake 'placeholder' host, which produced a misleading DNS 'name resolution' error.
+# Build the engine with NullPool to prevent open connection leaks across serverless function invokes.
 _engine = create_async_engine(
     get_database_url(),
     echo=os.getenv("SQL_ECHO", "").lower() == "true",
-    pool_pre_ping=True,
+    poolclass=NullPool,
 )
 
 SessionLocal = async_sessionmaker(_engine, class_=AsyncSession, expire_on_commit=False)
