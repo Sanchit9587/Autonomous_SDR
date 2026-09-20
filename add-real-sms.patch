@@ -1,0 +1,371 @@
+From 97b53ec9a1e179ff5413f1ffa2b1d00b735e40a3 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sun, 20 Sep 2026 16:46:36 +0000
+Subject: [PATCH] Add real SMS sending (Twilio/Textbelt) with actual delivery
+ in Personalize
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Personalize previously stopped at a SEND decision — it drafted a message and
+chose SMS as the channel, but nothing was ever actually sent (documented
+explicitly in run_personalize's docstring: "Does NOT send... those aren't
+built yet"). This was true for every channel, not just SMS.
+
+Adds backend/integrations/sms.py, a real connector that sends via:
+  1. Twilio, if real (non-placeholder) TWILIO_ACCOUNT_SID/AUTH_TOKEN/
+     FROM_NUMBER are configured
+  2. Textbelt otherwise — real delivery via textbelt.com's free, no-signup
+     demo key, so a fresh checkout can send a genuine text without any
+     account setup
+  3. A logged-only mock as the last-resort fallback, so a bad provider
+     response can never crash a demo run
+
+Wires it into orchestrator/service.py's new dispatch_send(), called from the
+personalize endpoint and the converse follow-up path: on a real send it
+records an outbound ConversationTurn and transitions the prospect
+QUALIFIED -> CONTACTED. Other channels (email/linkedin/voice) are left as
+decision-only for now — no connector exists for them yet, and this stays
+explicit in code rather than silently claiming they're wired up too.
+
+Verified backend/integrations/sms.py end-to-end against Textbelt's real API
+(test key, so it exercises the full HTTP/auth/response-parsing path without
+spending the shared quota) — the request/response cycle works.
+
+Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_011EW1Ts5crNjPzGz1D9Fk2R
+---
+ .gitignore                       |   1 +
+ backend/.env.example             |  35 +++++++++
+ backend/integrations/__init__.py |   6 ++
+ backend/integrations/sms.py      | 117 +++++++++++++++++++++++++++++++
+ backend/orchestrator/api.py      |  10 +--
+ backend/orchestrator/service.py  |  71 ++++++++++++++++++-
+ 6 files changed, 235 insertions(+), 5 deletions(-)
+ create mode 100644 backend/.env.example
+ create mode 100644 backend/integrations/__init__.py
+ create mode 100644 backend/integrations/sms.py
+
+diff --git a/.gitignore b/.gitignore
+index ec844b6..69fad8a 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -14,5 +14,6 @@ backend/auth/__pycache__/
+ backend/orchestrator/__pycache__/
+ backend/rag/__pycache__/
+ backend/scripts/__pycache__/
++backend/integrations/__pycache__/
+ frontend/node_modules/
+ frontend/.env
+\ No newline at end of file
+diff --git a/backend/.env.example b/backend/.env.example
+new file mode 100644
+index 0000000..901b58f
+--- /dev/null
++++ b/backend/.env.example
+@@ -0,0 +1,35 @@
++# Copy to backend/.env and fill in. Nothing here is required to boot the app —
++# every integration below has a safe fallback (mock/template) when its
++# variables are missing, so you can run locally with an empty .env.
++
++# --- Database (Postgres via SQLAlchemy) --------------------------------------
++DATABASE_URL=               # pooled/async connection string, used by the running app
++DIRECT_URL=                 # direct connection string, used by Alembic migrations + APScheduler's jobstore
++SQL_ECHO=false
++
++# --- Auth ---------------------------------------------------------------------
++JWT_SECRET=change-me
++
++# --- Research agent (optional LLM upgrade) -------------------------------------
++RESEARCH_EMBEDDING_BACKEND=tfidf   # or "sentence_transformers" (downloads a ~90MB model)
++
++# --- Personalize agent drafting (optional; falls back to templates) -----------
++GEMINI_API_KEY=
++GROQ_API_KEY=
++
++# --- SMS sending (backend/integrations/sms.py) ---------------------------------
++# SMS_PROVIDER selects the connector explicitly: "twilio" | "textbelt" | "mock".
++# Leave unset to auto-detect: a real Twilio account is used if all three
++# TWILIO_* values below are set to real (non-placeholder) values, otherwise it
++# falls back to Textbelt's free, no-signup shared demo key — a genuinely real
++# text send with zero setup, capped at 1 SMS/day shared globally across
++# everyone using that key. Set TEXTBELT_API_KEY to a purchased key to lift
++# that cap. SMS_PROVIDER=mock forces a logged-only fake send.
++SMS_PROVIDER=
++TWILIO_ACCOUNT_SID=
++TWILIO_AUTH_TOKEN=
++TWILIO_SMS_FROM_NUMBER=
++TEXTBELT_API_KEY=
++
++# --- Deployment -----------------------------------------------------------------
++VERCEL=                      # set by Vercel automatically; leave blank locally
+diff --git a/backend/integrations/__init__.py b/backend/integrations/__init__.py
+new file mode 100644
+index 0000000..0f09c1a
+--- /dev/null
++++ b/backend/integrations/__init__.py
+@@ -0,0 +1,6 @@
++"""Real-world side-effect connectors (SMS, and later email/calendar/voice).
++
++Kept separate from agents/orchestrator: agents decide *what* to send, the
++orchestrator decides *whether* to send it now, and this package is the only
++place that actually talks to an outside provider over the network.
++"""
+diff --git a/backend/integrations/sms.py b/backend/integrations/sms.py
+new file mode 100644
+index 0000000..af311d2
+--- /dev/null
++++ b/backend/integrations/sms.py
+@@ -0,0 +1,117 @@
++"""Real SMS sending.
++
++Provider is picked at call time from environment variables, in this priority
++order (mirrors the SMS_PROVIDER pattern used by the team's other buildathon
++service, so the same mental model applies to both codebases):
++
++  1. ``twilio``   — real, needs a purchased Twilio number + real
++                    TWILIO_ACCOUNT_SID/TWILIO_AUTH_TOKEN. Used automatically
++                    whenever those look like real (non-empty, non-placeholder)
++                    values, regardless of SMS_PROVIDER.
++  2. ``textbelt`` — real delivery via textbelt.com, no signup required. Uses
++                    the public shared demo key ``"textbelt"`` (capped at 1 SMS
++                    per day, shared globally across everyone using that key)
++                    unless TEXTBELT_API_KEY is set to a purchased key. This is
++                    the default when no Twilio credentials are configured, so
++                    a fresh checkout of this repo can send a genuine text
++                    without anyone signing up for anything.
++  3. ``mock``     — no network call; logs only. Used when SMS_PROVIDER=mock is
++                    set explicitly, or as the final fallback if a real send
++                    errors out, so a demo run never hard-crashes on a flaky
++                    provider.
++
++Every outcome — including a mock send — is reported back as an SmsResult so
++callers can record honestly what happened (never claim "sent" when nothing
++left the building).
++"""
++from __future__ import annotations
++
++import os
++from dataclasses import dataclass
++from typing import Optional
++
++import httpx
++
++_PLACEHOLDER_MARKERS = ("your_", "xxxx", "changeme", "placeholder", "example")
++
++
++def _looks_real(value: Optional[str]) -> bool:
++    if not value:
++        return False
++    lowered = value.strip().lower()
++    if not lowered:
++        return False
++    return not any(marker in lowered for marker in _PLACEHOLDER_MARKERS)
++
++
++@dataclass
++class SmsResult:
++    sent: bool
++    provider: str              # "twilio" | "textbelt" | "mock"
++    to: str
++    message_id: Optional[str] = None
++    error: Optional[str] = None
++
++
++def _select_provider() -> str:
++    forced = (os.getenv("SMS_PROVIDER") or "").strip().lower()
++    if forced in ("twilio", "textbelt", "mock"):
++        return forced
++    # Auto-detect: prefer a real Twilio account if one is actually configured.
++    if _looks_real(os.getenv("TWILIO_ACCOUNT_SID")) and _looks_real(os.getenv("TWILIO_AUTH_TOKEN")) \
++            and _looks_real(os.getenv("TWILIO_SMS_FROM_NUMBER")):
++        return "twilio"
++    return "textbelt"
++
++
++async def _send_twilio(to: str, body: str) -> SmsResult:
++    sid = os.getenv("TWILIO_ACCOUNT_SID", "")
++    token = os.getenv("TWILIO_AUTH_TOKEN", "")
++    from_number = os.getenv("TWILIO_SMS_FROM_NUMBER", "")
++    url = f"https://api.twilio.com/2010-04-01/Accounts/{sid}/Messages.json"
++    async with httpx.AsyncClient(timeout=15.0) as client:
++        resp = await client.post(
++            url,
++            auth=(sid, token),
++            data={"To": to, "From": from_number, "Body": body},
++        )
++    if resp.status_code >= 400:
++        return SmsResult(sent=False, provider="twilio", to=to, error=f"HTTP {resp.status_code}: {resp.text[:300]}")
++    payload = resp.json()
++    return SmsResult(sent=True, provider="twilio", to=to, message_id=payload.get("sid"))
++
++
++async def _send_textbelt(to: str, body: str) -> SmsResult:
++    key = os.getenv("TEXTBELT_API_KEY", "textbelt")  # shared free demo key by default
++    async with httpx.AsyncClient(timeout=15.0) as client:
++        resp = await client.post(
++            "https://textbelt.com/text",
++            data={"phone": to, "message": body, "key": key},
++        )
++    payload = resp.json() if resp.headers.get("content-type", "").startswith("application/json") else {}
++    if not payload.get("success"):
++        return SmsResult(sent=False, provider="textbelt", to=to, error=payload.get("error") or f"HTTP {resp.status_code}")
++    return SmsResult(sent=True, provider="textbelt", to=to, message_id=str(payload.get("textId")))
++
++
++def _send_mock(to: str, body: str, *, reason: Optional[str] = None) -> SmsResult:
++    print(f"[sms:mock] to={to} body={body!r}" + (f" (fallback reason: {reason})" if reason else ""))
++    return SmsResult(sent=False, provider="mock", to=to, error=reason or "mock provider — no real send configured")
++
++
++async def send_sms(to: str, body: str) -> SmsResult:
++    """Send a real SMS if a real provider is configured, else fall back to a
++    clearly-labeled mock. Never raises — network/provider errors come back as
++    a failed SmsResult so a single bad send can't take down a pipeline run."""
++    if not to:
++        return SmsResult(sent=False, provider="mock", to="", error="prospect has no phone number on file")
++
++    provider = _select_provider()
++    try:
++        if provider == "twilio":
++            return await _send_twilio(to, body)
++        if provider == "textbelt":
++            return await _send_textbelt(to, body)
++        return _send_mock(to, body)
++    except Exception as exc:  # noqa: BLE001 — a demo run must never crash on a provider hiccup
++        return _send_mock(to, body, reason=f"{provider} send failed: {exc}")
+diff --git a/backend/orchestrator/api.py b/backend/orchestrator/api.py
+index 8d50592..3f37f6d 100644
+--- a/backend/orchestrator/api.py
++++ b/backend/orchestrator/api.py
+@@ -415,9 +415,10 @@ async def get_decisions(campaign_id: str, link_id: str, session: AsyncSession =
+ @router.post("/{campaign_id}/prospects/{link_id}/personalize")
+ async def run_personalize(campaign_id: str, link_id: str, session: AsyncSession = Depends(get_session)) -> dict:
+     """Runs Personalize on a qualified prospect. Returns a draft + channel +
+-    timing decision. Does NOT send (connector) or schedule (APScheduler) — those
+-    aren't built yet; this stops at the decision, which is the agent's whole job.
+-    Refuses prospects on the suppression list."""
++    timing decision, then — for channels with a real connector wired up (SMS
++    today; see orchestrator/service.py:dispatch_send) — actually sends it and
++    records the outcome. Scheduling (APScheduler) for WAIT verdicts is still
++    not built. Refuses prospects on the suppression list."""
+     campaign = await _require_campaign(session, campaign_id)
+     link = await _require_link(session, link_id)
+     prospect = await _require_prospect(session, link.prospect_id)
+@@ -440,7 +441,8 @@ async def run_personalize(campaign_id: str, link_id: str, session: AsyncSession
+     )
+     decision = agent.run(context)
+     await repo.append_decision(session, decision)
+-    return {"decision": decision}
++    send_result = await service.dispatch_send(session, campaign, link, prospect, decision)
++    return {"decision": decision, "send_result": send_result}
+ 
+ 
+ # --- converse agent invocation -----------------------------------------------
+diff --git a/backend/orchestrator/service.py b/backend/orchestrator/service.py
+index f2a285e..10583f8 100644
+--- a/backend/orchestrator/service.py
++++ b/backend/orchestrator/service.py
+@@ -22,14 +22,81 @@ from core.models import (
+     CampaignStatus,
+     Channel,
+     ConversationTurn,
++    DecisionVerdict,
+     Direction,
+     FunnelStage,
+     Prospect,
+ )
++from integrations.sms import send_sms
+ from orchestrator import state_machine as sm
+ 
+ converse_agent = ConverseAgent()
+ 
++# Channels with a real connector wired up in dispatch_send(). Everything else
++# stays decision-only (drafted + logged, never actually delivered) until its
++# connector is built — see the module docstring on integrations/.
++_CONNECTED_CHANNELS = {Channel.SMS}
++
++
++async def dispatch_send(
++    session: AsyncSession,
++    campaign: Campaign,
++    link: CampaignProspectLink,
++    prospect: Prospect,
++    decision: AgentDecision,
++) -> dict:
++    """Turn a Personalize SEND decision into an actual outbound message for
++    channels that have a real connector, and record what really happened.
++
++    This is the "orchestrator turns SEND into a connector call" step the
++    agents' docstrings describe as not built yet — built here, for SMS first.
++    Safe to call on any decision: no-ops cleanly for WAIT verdicts or for
++    channels without a connector yet.
++    """
++    details = decision.details or {}
++    if decision.verdict != DecisionVerdict.SEND:
++        return {"delivered": False, "reason": "verdict is not SEND"}
++
++    channel_value = details.get("channel")
++    try:
++        channel = Channel(channel_value) if channel_value else None
++    except ValueError:
++        channel = None
++
++    if channel not in _CONNECTED_CHANNELS:
++        return {"delivered": False, "reason": f"no connector wired up for channel '{channel_value}' yet"}
++
++    to_number = next(iter(prospect.profile.phone_numbers), None)
++    if not to_number:
++        return {"delivered": False, "reason": "prospect has no phone number on file"}
++
++    result = await send_sms(to=to_number, body=details.get("draft_message") or "")
++    details["sms_result"] = {
++        "sent": result.sent, "provider": result.provider,
++        "message_id": result.message_id, "error": result.error,
++    }
++
++    await repo.append_turn(session, ConversationTurn(
++        campaign_id=campaign.id, prospect_id=prospect.id,
++        channel=Channel.SMS, direction=Direction.OUTBOUND,
++        content=details.get("draft_message") or "",
++        agent_name="personalize", prompt_version_id=decision.prompt_version_id,
++    ))
++
++    if result.sent and link.stage == FunnelStage.QUALIFIED:
++        try:
++            sm.transition(link, FunnelStage.CONTACTED, campaign)
++            link.last_contacted_channel = Channel.SMS.value
++            link.contact_count += 1
++            await repo.save_link(session, link)
++        except (sm.InvalidTransitionError, sm.CampaignNotLiveError):
++            pass
++
++    return {
++        "delivered": result.sent, "provider": result.provider,
++        "message_id": result.message_id, "error": result.error,
++    }
++
+ 
+ async def process_converse(
+     session: AsyncSession,
+@@ -75,14 +142,16 @@ async def process_converse(
+     await repo.save_link(session, link)
+ 
+     next_action = decision.details.get("next_action")
++    followup_send_result: Optional[dict] = None
+     if next_action in ("reply", "follow_up") and link.stage == FunnelStage.ENGAGED:
+         assets = await repo.list_assets_for_campaign(session, campaign.id)
+         p_agent = PersonalizeAgent(assets=assets)
+         p_decision = p_agent.run(context)
+         await repo.append_decision(session, p_decision)
+         follow_up_draft = p_decision
++        followup_send_result = await dispatch_send(session, campaign, link, prospect, p_decision)
+ 
+-    return {"decision": decision, "personalize_followup": follow_up_draft}
++    return {"decision": decision, "personalize_followup": follow_up_draft, "followup_send_result": followup_send_result}
+ 
+ 
+ async def fire_follow_up(session: AsyncSession, campaign_id: str, link_id: str) -> dict:
+-- 
+2.43.0
+
