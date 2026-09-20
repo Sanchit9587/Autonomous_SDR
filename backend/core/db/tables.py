@@ -79,6 +79,7 @@ class CampaignProspectLinkORM(TimestampMixin, Base):
     contact_count: Mapped[int] = mapped_column(Integer, default=0)
     follow_up_owed: Mapped[bool] = mapped_column(Boolean, default=False)
     next_follow_up_at: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    deal_value: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
 
 
 class PersonaORM(TimestampMixin, Base):

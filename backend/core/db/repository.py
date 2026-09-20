@@ -163,6 +163,22 @@ async def count_touches_today(session: AsyncSession, campaign_id: str) -> tuple[
     return len(rows), per_channel
 
 
+async def count_touches_total(session: AsyncSession, campaign_id: str) -> dict[str, int]:
+    """All-time per-channel OUTBOUND touch counts for a campaign — the CAC
+    calculation's cost basis (cost-per-mille × touches), as opposed to
+    count_touches_today's daily-pace use."""
+    rows = (await session.execute(
+        select(t.ConversationTurnORM.channel).where(
+            t.ConversationTurnORM.campaign_id == campaign_id,
+            t.ConversationTurnORM.direction == "outbound",
+        )
+    )).scalars().all()
+    per_channel: dict[str, int] = {}
+    for ch in rows:
+        per_channel[ch] = per_channel.get(ch, 0) + 1
+    return per_channel
+
+
 # --- suppression ------------------------------------------------------------
 async def add_suppression(session: AsyncSession, key: str) -> None:
     await session.merge(t.SuppressionEntryORM(key=key.strip().lower()))

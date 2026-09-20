@@ -116,6 +116,7 @@ export interface CampaignAsset {
 
 export interface ProspectProfile {
   name: string;
+  website?: string | null;
   linkedin_url?: string | null;
   headline?: string | null;
   location?: string | null;
@@ -145,6 +146,7 @@ export interface CampaignProspectLink {
   contact_count: number;
   follow_up_owed: boolean;
   next_follow_up_at?: string | null;
+  deal_value?: number | null;
 }
 
 export interface AgentDecision {

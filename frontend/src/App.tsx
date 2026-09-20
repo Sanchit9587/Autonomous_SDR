@@ -9,6 +9,7 @@ import { CampaignSummary } from "./pages/CampaignSummary";
 import { CustomerProfiles } from "./pages/CustomerProfiles";
 import { Assets } from "./pages/Assets";
 import { Prospects } from "./pages/Prospects";
+import { Dashboard } from "./pages/Dashboard";
 import { RepDashboard } from "./pages/rep/RepDashboard";
 import { LiveActivity } from "./pages/rep/LiveActivity";
 import { Escalations } from "./pages/rep/Escalations";
@@ -37,6 +38,7 @@ export function App() {
     <Routes>
       <Route path="/login" element={<Login />} />
 
+      <Route path="/dashboard" element={<Managed><Dashboard /></Managed>} />
       <Route path="/campaigns" element={<Managed><Campaigns /></Managed>} />
       <Route path="/campaigns/new" element={<Managed><CampaignConfiguration mode="create" /></Managed>} />
       <Route path="/campaigns/:id" element={<Managed><CampaignSummary /></Managed>} />
@@ -50,8 +52,8 @@ export function App() {
       <Route path="/rep/prospects" element={<RepView><RepProspects /></RepView>} />
       <Route path="/rep/escalations" element={<RepView><Escalations /></RepView>} />
 
-      <Route path="/" element={<Navigate to="/campaigns" replace />} />
-      <Route path="*" element={<Navigate to="/campaigns" replace />} />
+      <Route path="/" element={<Navigate to="/dashboard" replace />} />
+      <Route path="*" element={<Navigate to="/dashboard" replace />} />
     </Routes>
   );
 }

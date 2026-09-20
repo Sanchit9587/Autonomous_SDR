@@ -28,9 +28,21 @@ export const prospectsApi = {
       { delay_days }
     ),
 
+  setDealValue: (campaignId: string, linkId: string, deal_value: number) =>
+    api.post<CampaignProspectLink>(
+      `/campaigns/${campaignId}/prospects/${linkId}/deal-value`,
+      { deal_value }
+    ),
+
   researchDiscovered: (campaignId: string) =>
     api.post<{ processed: number; qualified: number; rejected: number; needs_review: number }>(
       `/campaigns/${campaignId}/research-discovered`
+    ),
+
+  discover: (campaignId: string, max_results: number, max_pages_per_domain: number) =>
+    api.post<{ added: number; skipped_duplicate: number; found: number }>(
+      `/campaigns/${campaignId}/prospects/discover`,
+      { max_results, max_pages_per_domain }
     ),
 
   uploadCsv: async (

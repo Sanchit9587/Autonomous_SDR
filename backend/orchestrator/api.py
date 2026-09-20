@@ -13,9 +13,11 @@ fastapi.concurrency.run_in_threadpool — the call sites are all marked below.
 """
 from __future__ import annotations
 
+import os
 from typing import Optional
 
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
+from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -25,6 +27,7 @@ from agents.research.agent import ResearchAgent
 from auth.dependencies import require_manager
 from core.db import repository as repo
 from core.db.engine import get_session
+from discovery.pipeline import discover_companies
 from orchestrator import csv_import
 from core.models import (
     AgentDecision,
@@ -403,6 +406,77 @@ async def upload_prospects_csv(campaign_id: str, file: UploadFile = File(...), s
         "skipped_invalid": parsed.invalid_rows,
         "total_rows": parsed.total_rows,
     }
+
+
+# --- discovery (Maps + web enrichment) ---------------------------------------
+class DiscoverRequest(BaseModel):
+    max_results: int = 10          # businesses to pull off Google Maps
+    max_pages_per_domain: int = 4  # pages fetched per business during enrichment
+
+
+@router.post("/{campaign_id}/prospects/discover")
+async def discover_prospects(
+    campaign_id: str, body: DiscoverRequest = DiscoverRequest(), session: AsyncSession = Depends(get_session)
+) -> dict:
+    """Company-centric lead discovery: builds a search from the campaign's
+    ICP, finds matching businesses on Google Maps, enriches each one's
+    website for contact info + an about-page summary, and lands them at
+    'discovered' — same next step as a CSV import ('Research all discovered').
+
+    Needs a real Chromium binary and can take a while, so it can't run on
+    Vercel's serverless functions; run it against a locally-running backend.
+    """
+    if os.getenv("VERCEL") == "1":
+        raise HTTPException(
+            503,
+            "Discovery needs a real browser and can run long — it isn't available on the "
+            "deployed (Vercel) backend. Run this from your locally-running backend instead.",
+        )
+    campaign = await _require_campaign(session, campaign_id)
+
+    # Playwright/httpx are blocking and run their own event loop internally,
+    # so this must go through a thread rather than being awaited directly
+    # (same reasoning as the run_in_threadpool note in this module's docstring).
+    prospects = await run_in_threadpool(
+        discover_companies, campaign.icp, campaign.name, body.max_results, body.max_pages_per_domain
+    )
+
+    existing = await repo.existing_dedupe_keys_for_campaign(session, campaign_id)
+    added = 0
+    skipped_duplicate = 0
+    for prospect in prospects:
+        key = prospect.dedupe_key()
+        if key in existing:
+            skipped_duplicate += 1
+            continue
+        existing.add(key)
+        await repo.save_prospect(session, prospect)
+        await repo.save_link(session, CampaignProspectLink(campaign_id=campaign_id, prospect_id=prospect.id))
+        added += 1
+
+    return {
+        "added": added,
+        "skipped_duplicate": skipped_duplicate,
+        "found": len(prospects),
+    }
+
+
+class DealValueRequest(BaseModel):
+    deal_value: float
+
+
+@router.post("/{campaign_id}/prospects/{link_id}/deal-value", response_model=CampaignProspectLink)
+async def set_deal_value(
+    campaign_id: str, link_id: str, body: DealValueRequest, session: AsyncSession = Depends(get_session)
+) -> CampaignProspectLink:
+    """Manual input for the CAC/LTV dashboard metric — there's no automatic
+    revenue signal anywhere in the system, so a manager records what a closed
+    deal is actually worth."""
+    link = await _require_link(session, link_id)
+    if link.campaign_id != campaign_id:
+        raise HTTPException(404, f"CampaignProspectLink {link_id} not found in campaign {campaign_id}")
+    updated = link.model_copy(update={"deal_value": body.deal_value})
+    return await repo.save_link(session, updated)
 
 
 @router.get("/{campaign_id}/prospects/{link_id}/decisions", response_model=list[AgentDecision])

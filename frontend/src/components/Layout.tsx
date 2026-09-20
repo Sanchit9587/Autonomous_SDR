@@ -4,6 +4,7 @@ import { useAuth } from "../context/AuthContext";
 import { theme } from "../theme";
 
 const NAV = [
+  { to: "/dashboard", label: "Dashboard", icon: "📊" },
   { to: "/campaigns", label: "Campaigns", icon: "🚩" },
   { to: "/profiles", label: "Customer Profiles", icon: "👤" },
   { to: "/assets", label: "Assets", icon: "📁" },

@@ -13,9 +13,16 @@ from core.models.base import FunnelStage, TimestampedModel, _new_id
 
 
 class ProspectProfile(BaseModel):
-    """Static-ish facts about a person, shared across every campaign they're in."""
+    """Static-ish facts about a prospect, shared across every campaign they're in.
+
+    Usually a person, but a prospect can also be company-centric (e.g. leads
+    surfaced by the discovery pipeline before a named contact is identified):
+    in that case `name`/`company_name` are the business name and `position`
+    is left unset.
+    """
 
     name: str
+    website: Optional[str] = None
     linkedin_url: Optional[str] = None
     headline: Optional[str] = None
     location: Optional[str] = None
@@ -62,3 +69,8 @@ class CampaignProspectLink(TimestampedModel):
     #   if any (informational / for the dashboard).
     follow_up_owed: bool = False
     next_follow_up_at: Optional[str] = None
+
+    # Manual input for the LTV/CAC dashboard metric — a manager fills this in
+    # once a deal closes (won at 'opportunity' stage or later). Not agent-set:
+    # there's no automatic revenue signal anywhere in the system yet.
+    deal_value: Optional[float] = None

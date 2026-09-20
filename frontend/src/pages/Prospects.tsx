@@ -21,6 +21,8 @@ export function Prospects() {
   const [busyLink, setBusyLink] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [batchBusy, setBatchBusy] = useState(false);
+  const [discoverBusy, setDiscoverBusy] = useState(false);
+  const [discoverResults, setDiscoverResults] = useState<string>("10");
   const fileRef = useRef<HTMLInputElement>(null);
 
   // add-prospect form
@@ -88,6 +90,18 @@ export function Prospects() {
     finally { setBatchBusy(false); }
   };
 
+  const discover = async () => {
+    if (!campaignId) return;
+    setDiscoverBusy(true); setError(null); setNotice(null);
+    try {
+      const n = Number(discoverResults) || 10;
+      const r = await prospectsApi.discover(campaignId, n, 4);
+      setNotice(`Found ${r.found} business(es) · ${r.added} added · ${r.skipped_duplicate} duplicate(s) skipped.`);
+      load();
+    } catch (e) { setError(String((e as Error).message)); }
+    finally { setDiscoverBusy(false); }
+  };
+
   const act = async (linkId: string, fn: () => Promise<unknown>, updater?: (l: CampaignProspectLink) => void) => {
     setBusyLink(linkId);
     setError(null);
@@ -127,6 +141,16 @@ export function Prospects() {
       setRows((rs) => rs.map((r) => (r.link.id === row.link.id ? { ...r, link: { ...r.link, stage: (res.decision.details["target_stage"] as CampaignProspectLink["stage"]) ?? r.link.stage } } : r)));
     });
 
+  const setDealValue = (row: Row) =>
+    act(row.link.id, async () => {
+      const raw = prompt(`Deal value for ${row.prospect.profile.name} (USD):`, row.link.deal_value != null ? String(row.link.deal_value) : "");
+      if (raw == null || raw.trim() === "") return;
+      const value = Number(raw);
+      if (Number.isNaN(value)) { setError("Deal value must be a number."); return; }
+      const updated = await prospectsApi.setDealValue(campaignId!, row.link.id, value);
+      setRows((rs) => rs.map((r) => (r.link.id === row.link.id ? { ...r, link: updated } : r)));
+    });
+
   const openHistory = async (row: Row) => {
     setHistoryLink(row.link.id);
     try {
@@ -153,19 +177,24 @@ export function Prospects() {
           <div>
             <div style={{ color: "#fff", fontSize: 13, fontWeight: 700 }}>Import & research</div>
             <div style={{ color: theme.textMuted, fontSize: 10, marginTop: 2 }}>
-              Upload a CSV of leads, then research all discovered prospects at once.
+              Upload a CSV of leads, or discover new companies from this campaign's ICP, then research all discovered prospects at once.
             </div>
           </div>
           <span style={{ flex: 1 }} />
           <input ref={fileRef} type="file" accept=".csv" style={{ display: "none" }}
             onChange={(e) => { const f = e.target.files?.[0]; if (f) uploadCsv(f); }} />
           <Button onClick={() => fileRef.current?.click()}>⬆ Upload CSV</Button>
+          <span style={{ display: "flex", alignItems: "center", gap: 6 }}>
+            <Input value={discoverResults} onChange={setDiscoverResults} style={{ width: 48, textAlign: "center" }} />
+            <Button onClick={discover} disabled={discoverBusy}>{discoverBusy ? "Discovering…" : "🔎 Discover via search"}</Button>
+          </span>
           <Button variant="primary" onClick={researchAllDiscovered} disabled={batchBusy || discoveredCount === 0}>
             {batchBusy ? "Researching…" : `🔬 Research all discovered${discoveredCount ? ` (${discoveredCount})` : ""}`}
           </Button>
         </div>
         <div style={{ color: theme.textFaint, fontSize: 9, marginTop: 10 }}>
           CSV headers are flexible — e.g. name/full name, company, title/role, email, linkedin, location, employees. Only name is required.
+          Discovery builds a search from this campaign's ICP (industry/criteria + geography) and returns company-level leads — only available when the backend is running locally, not on the deployed Vercel instance.
         </div>
       </Card>
 
@@ -197,11 +226,19 @@ export function Prospects() {
               {row.link.fit_score != null && (
                 <span style={{ color: theme.textDim, fontSize: 11 }}>ICP {row.link.fit_score}</span>
               )}
+              {row.link.stage === "opportunity" && (
+                <span style={{ color: theme.green, fontSize: 11 }}>
+                  {row.link.deal_value != null ? `$${row.link.deal_value.toFixed(2)}` : "no deal value yet"}
+                </span>
+              )}
               <span style={{ flex: 1 }} />
               <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
                 <Button onClick={() => runResearch(row)} disabled={busyLink === row.link.id}>🔬 Research</Button>
                 <Button onClick={() => runPersonalize(row)} disabled={busyLink === row.link.id || row.link.stage !== "qualified"}>✍ Personalize</Button>
                 <Button onClick={() => simulateReply(row)} disabled={busyLink === row.link.id}>💬 Sim. reply</Button>
+                {row.link.stage === "opportunity" && (
+                  <Button onClick={() => setDealValue(row)} disabled={busyLink === row.link.id}>💰 Deal value</Button>
+                )}
                 <Button onClick={() => openHistory(row)}>↺ History</Button>
               </div>
             </div>
@@ -237,8 +274,8 @@ export function Prospects() {
               ))}
             </div>
           </div>
-        </div>
+        </div>              
       )}
     </div>
   );
-}
+}                                                                                                                     
