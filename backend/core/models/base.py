@@ -66,6 +66,19 @@ class ToneEnum(StrEnum):
     EXECUTIVE = "executive"
 
 
+class UserRole(StrEnum):
+    MANAGER = "manager"       # control-plane app (Ava): campaigns, config, assets
+    REP = "rep"               # operational app (Mark): dashboard, prospects, escalations
+    ADMIN = "admin"           # everything
+
+
+class ChannelMode(StrEnum):
+    """Per-channel execution mode (Campaign Config "Automate / Approval / Manual")."""
+    AUTOMATE = "automate"     # agent acts autonomously
+    APPROVAL = "approval"     # agent drafts, human approves before send
+    MANUAL = "manual"         # human does it; agent only assists
+
+
 class AssetType(StrEnum):
     IMAGE = "image"
     PDF = "pdf"
@@ -95,5 +108,7 @@ __all__ = [
     "DecisionVerdict",
     "ToneEnum",
     "AssetType",
+    "UserRole",
+    "ChannelMode",
     "_new_id",
 ]

@@ -5,15 +5,18 @@ from core.models.base import (
     AssetType,
     CampaignStatus,
     Channel,
+    ChannelMode,
     DecisionVerdict,
     FunnelStage,
     TimestampedModel,
     ToneEnum,
+    UserRole,
 )
 from core.models.campaign import AgentSettings, Campaign, ChannelPolicy, ICPFilter
 from core.models.conversation import ConversationTurn, Direction
 from core.models.persona import FollowUpPolicy, MessageTemplate, Persona
 from core.models.prospect import CampaignProspectLink, Prospect, ProspectProfile
+from core.models.user import LoginRequest, TokenResponse, User, UserCreate, UserInDB
 
 __all__ = [
     "AgentDecision",
@@ -39,4 +42,11 @@ __all__ = [
     "CampaignProspectLink",
     "Prospect",
     "ProspectProfile",
+    "ChannelMode",
+    "UserRole",
+    "User",
+    "UserInDB",
+    "UserCreate",
+    "LoginRequest",
+    "TokenResponse",
 ]

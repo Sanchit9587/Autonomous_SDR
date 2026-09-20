@@ -17,16 +17,21 @@ from core.models import (
     Prospect,
     PromptVersion,
 )
+from core.models.user import User, UserInDB
 
 
 # --- Campaign ---------------------------------------------------------------
 def campaign_to_orm(m: Campaign) -> t.CampaignORM:
     return t.CampaignORM(
-        id=m.id, name=m.name, description=m.description, owner=m.owner, status=m.status.value,
+        id=m.id, name=m.name, description=m.description, vision_statement=m.vision_statement,
+        owner=m.owner, status=m.status.value,
         icp=m.icp.model_dump(mode="json"),
         agent_settings={k: v.model_dump(mode="json") for k, v in m.agent_settings.items()},
         channel_policies=[c.model_dump(mode="json") for c in m.channel_policies],
         default_channel_priority=[c.value for c in m.default_channel_priority],
+        budget=m.budget, start_date=m.start_date, end_date=m.end_date,
+        target_scale=m.target_scale, pace_per_day=m.pace_per_day, goals=m.goals,
+        sources=m.sources, connector_configs=m.connector_configs,
         system_prompt_version=m.system_prompt_version, assigned_rep_ids=m.assigned_rep_ids,
         created_at=m.created_at, updated_at=m.updated_at,
     )
@@ -34,9 +39,15 @@ def campaign_to_orm(m: Campaign) -> t.CampaignORM:
 
 def campaign_to_model(o: t.CampaignORM) -> Campaign:
     return Campaign.model_validate({
-        "id": o.id, "name": o.name, "description": o.description, "owner": o.owner, "status": o.status,
+        "id": o.id, "name": o.name, "description": o.description, "vision_statement": o.vision_statement,
+        "owner": o.owner, "status": o.status,
         "icp": o.icp, "agent_settings": o.agent_settings, "channel_policies": o.channel_policies,
-        "default_channel_priority": o.default_channel_priority, "system_prompt_version": o.system_prompt_version,
+        "default_channel_priority": o.default_channel_priority,
+        "budget": o.budget, "start_date": o.start_date, "end_date": o.end_date,
+        "target_scale": o.target_scale, "pace_per_day": o.pace_per_day, "goals": o.goals,
+        "sources": o.sources or ["apollo", "linkedin"],
+        "connector_configs": o.connector_configs or {},
+        "system_prompt_version": o.system_prompt_version,
         "assigned_rep_ids": o.assigned_rep_ids, "created_at": o.created_at, "updated_at": o.updated_at,
     })
 
@@ -57,6 +68,7 @@ def link_to_orm(m: CampaignProspectLink) -> t.CampaignProspectLinkORM:
         fit_score=m.fit_score, qualification_reasoning=m.qualification_reasoning, persona_id=m.persona_id,
         human_approved=m.human_approved, human_approved_by=m.human_approved_by,
         last_contacted_channel=m.last_contacted_channel, contact_count=m.contact_count,
+        follow_up_owed=m.follow_up_owed, next_follow_up_at=m.next_follow_up_at,
         created_at=m.created_at, updated_at=m.updated_at,
     )
 
@@ -67,6 +79,7 @@ def link_to_model(o: t.CampaignProspectLinkORM) -> CampaignProspectLink:
         "fit_score": o.fit_score, "qualification_reasoning": o.qualification_reasoning, "persona_id": o.persona_id,
         "human_approved": o.human_approved, "human_approved_by": o.human_approved_by,
         "last_contacted_channel": o.last_contacted_channel, "contact_count": o.contact_count,
+        "follow_up_owed": o.follow_up_owed, "next_follow_up_at": o.next_follow_up_at,
         "created_at": o.created_at, "updated_at": o.updated_at,
     })
 
@@ -159,4 +172,31 @@ def turn_to_model(o: t.ConversationTurnORM) -> ConversationTurn:
         "direction": o.direction, "content": o.content, "agent_name": o.agent_name,
         "prompt_version_id": o.prompt_version_id, "call_duration_seconds": o.call_duration_seconds,
         "transcript_confidence": o.transcript_confidence, "created_at": o.created_at, "updated_at": o.updated_at,
+    })
+
+
+# --- User -------------------------------------------------------------------
+def user_to_orm(m: UserInDB) -> t.UserORM:
+    return t.UserORM(
+        id=m.id, email=m.email.lower(), full_name=m.full_name, title=m.title,
+        role=m.role.value, is_active=m.is_active, hashed_password=m.hashed_password,
+        created_at=m.created_at, updated_at=m.updated_at,
+    )
+
+
+def user_to_indb(o: t.UserORM) -> UserInDB:
+    """Internal — includes the password hash for auth verification."""
+    return UserInDB.model_validate({
+        "id": o.id, "email": o.email, "full_name": o.full_name, "title": o.title,
+        "role": o.role, "is_active": o.is_active, "hashed_password": o.hashed_password,
+        "created_at": o.created_at, "updated_at": o.updated_at,
+    })
+
+
+def user_to_model(o: t.UserORM) -> User:
+    """Public — no password hash."""
+    return User.model_validate({
+        "id": o.id, "email": o.email, "full_name": o.full_name, "title": o.title,
+        "role": o.role, "is_active": o.is_active,
+        "created_at": o.created_at, "updated_at": o.updated_at,
     })
