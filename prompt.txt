@@ -1,0 +1,68 @@
+This is a big, useful drop — the frontend reveals a fair amount of scope we haven't built. Let me go through every page, map what it needs against what exists, and lay out the gap. No coding yet, as you said.
+
+First, one important framing note: there are two distinct frontends here with different users, and that itself is a backend requirement I want to flag up top.
+
+Two separate apps, two roles
+Manager app (dark purple theme — Ava Chen, "Product Marketing Lead"): Campaigns, Customer Profiles, Assets, Generative Edits, Campaign Config, Choreography Builder, Campaign Summary, Login. This is the control plane.
+Rep app (teal/light theme — Mark Anders, "Sales Representative"): SDR Campaigns dashboard, Live Activity, Prospects, Escalations. This is the operational/monitoring view.
+The Login Dropdown page confirms it — it has a role selector ("Campaign Manager" / "Administrator"). So the backend now needs authentication + roles, which we've never built. That's a net-new subsystem.
+
+Page-by-page: what each needs from the backend
+Login / Login Dropdown
+
+Net-new: auth (email/password + the "continue with Google" implies OAuth, though we can stub that), session/token issuance, and a role on the user (Manager / Rep / Admin). We have no User model, no auth at all right now. This is the biggest net-new area.
+Campaigns list / Campaign Dashboard
+
+Mostly exists. Campaign CRUD, status, funnel counts — all built. The dashboard shows per-campaign metrics (prospects, outreach, meetings) which we can derive from links/decisions.
+Gap: some aggregate metrics (conversions, reply rates, "meetings booked") aren't computed anywhere yet — we store the raw data but have no metrics/rollup endpoints.
+Campaign Configuration (the big one)
+
+Campaign vision statement, budget, start/end date, target scale, pace (touches/day) → all net-new fields on Campaign. We don't have budget/dates/pace at all.
+Profile Match Threshold slider → maps to our existing decision_threshold. ✓ exists.
+Sources: Apollo / LinkedIn connector toggles + Upload CSV → connector config is net-new; CSV upload is net-new (we discussed it, never built).
+ICP builder → we have ICPFilter, but "50-500 employees" (company size range) is a field we don't have.
+Goals (Book meeting / Sale / Signup / Free trial) → net-new goals field on Campaign.
+Channels & Permissions with per-channel Automate / Approval / Manual mode + CPM cost → this is significant. We have ChannelPolicy but no per-channel execution mode (automate vs require-approval vs manual) and no cost tracking. The Approval mode ties back to the human-approval concept we deferred.
+Choreography Builder (net-new subsystem)
+
+A visual drag-drop sequence builder: Actions (Email/LinkedIn/SMS/Voice), Logic (Wait/delay, Follow-up loop, Decision), Outcomes (Book meeting/Escalate/Suppress). This is a campaign-level workflow definition — an ordered graph of steps with branching decisions.
+Right now, our "sequence" is hardcoded in the state machine + follow-up policy. This page implies the sequence itself is data the manager designs — first touch → wait 2 days → decision (replied?) → branch. That's a real model we don't have: a Choreography/Sequence with steps, delays, and decision branches, and an executor that walks it.
+This is arguably the biggest conceptual gap — it means outreach flow becomes configurable data, not hardcoded logic. Worth a serious scoping conversation on its own.
+Campaign Summary
+
+Read-only rollup of everything (strategy, ICP, execution, choreography, assets). Mostly a composite GET over data we'd have once the above fields exist. "Launch" button → activate campaign (exists). "Save as Template" → net-new campaign templating.
+Customer Profiles
+
+This is our Persona concept (segments). Exists as a model. Need CRUD endpoints exposed (we have create/list, probably need update/delete).
+Assets
+
+Messaging sliders (Formality / Depth / Energy) → net-new tone dimensions (we have a tone enum + notes; this is a richer numeric tone model).
+Templates (Email/SMS/WhatsApp/Call scripts) → we have MessageTemplate per persona; this page shows them campaign-level too. WhatsApp is a new channel (we have Email/LinkedIn/SMS/Voice, no WhatsApp).
+Knowledge Base (Product/Proof/Policies, doc counts, RAG) → we have a RAG retriever but no document store / ingestion / management — this page manages KB docs as first-class objects. Net-new: a KnowledgeDocument model + CRUD + ingestion into the retriever.
+Generative Edits / Campaign Edits (net-new subsystem)
+
+AI analyzes campaign performance and proposes changes ("Prioritise Email", "promote Case Study #14", "raise ICP threshold"), which the manager can Apply/Discard. This is a self-optimization agent — net-new, and maps to the PS's "Measurement & Optimisation" scored category. Needs: metrics aggregation + an analysis agent that reads performance and emits suggestions + an apply mechanism.
+SDR Campaigns (rep dashboard)
+
+Rep-facing view of campaigns they're assigned to → needs rep assignment (we have assigned_rep_ids on Campaign but no User/rep model behind it) and rep-scoped queries.
+Live Activity
+
+Real-time feed of agent actions → we have AgentDecision as the data; needs a chronological activity feed endpoint, possibly streaming (SSE/websocket) for "live," though polling is fine for the hackathon.
+Prospects (this one's detailed — has real data bindings)
+
+Prospect list with ICP score, Confidence, Sentiment, CAC, Est. LTV, LTV:CAC ratio, Last→Next action. We have ICP score (fit_score); Confidence, Sentiment come from Converse decisions; CAC / LTV / ratio are net-new economic fields we've never modeled.
+Decision history modal — a full timeline (Previous state → Trigger → Evidence → Rule applied → Action → Result → Next action). This is huge and important: it's the decision-trace the PS explicitly rewards. We store AgentDecisions but not in this rich structured-trace shape (evidence/signals, rule/policy applied, actor type AI/External/System). Needs either richer decision logging or a trace-assembly endpoint.
+Escalations
+
+Queue of items the agents escalated to humans → we have ESCALATE verdicts in decisions; needs an escalations endpoint that surfaces them as a workqueue, plus actions to resolve/claim them.
+The net-new backend subsystems, summarized
+Grouping the gaps into buildable chunks, roughly by size:
+
+1)Auth + Users + Roles — login, sessions, Manager/Rep/Admin, rep assignment. (Net-new, foundational for both apps.)
+2)Choreography / Sequence engine — configurable outreach flows as data + an executor. (Largest conceptual net-new; partially overlaps the state machine + scheduler we built.)
+3)Expanded Campaign config — budget, dates, pace, goals, company-size, per-channel execution mode (automate/approval/manual), CPM/cost. (Many new fields + the approval-mode logic.)
+4)Knowledge Base management — KnowledgeDocument model, CRUD, ingestion into RAG. (Net-new; RAG retriever exists but not doc management.)
+5)Metrics & Optimization — aggregation endpoints (conversions, reply rate, per-channel performance, CAC/LTV) + the Generative Edits analysis agent. (Net-new; scored category.)
+6)Decision-trace / history — richer structured traces for the Prospects history modal + Live Activity feed + Escalations queue. (Partially exists as AgentDecision; needs enrichment + assembly endpoints.)
+7)CSV upload + connector config — prospect import, per-campaign connector settings. (Discussed, never built.)
+8)Smaller CRUD gaps — Persona (Customer Profiles) update/delete, campaign templating ("Save as Template"), WhatsApp channel, richer tone model.

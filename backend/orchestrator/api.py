@@ -15,7 +15,7 @@ from __future__ import annotations
 
 from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -25,6 +25,7 @@ from agents.research.agent import ResearchAgent
 from auth.dependencies import require_manager
 from core.db import repository as repo
 from core.db.engine import get_session
+from orchestrator import csv_import
 from core.models import (
     AgentDecision,
     AgentSettings,
@@ -75,6 +76,7 @@ class CreateCampaignRequest(BaseModel):
     target_scale: Optional[int] = None
     pace_per_day: Optional[int] = None
     goals: list[str] = []
+    assigned_rep_ids: list[str] = []
 
 
 class UpdateCampaignRequest(BaseModel):
@@ -131,7 +133,13 @@ async def _require_prospect(session: AsyncSession, prospect_id: str) -> Prospect
 # --- campaign lifecycle ------------------------------------------------------
 @router.post("", response_model=Campaign)
 async def create_campaign(body: CreateCampaignRequest, session: AsyncSession = Depends(get_session)) -> Campaign:
-    campaign = Campaign(**body.model_dump())
+    data = body.model_dump()
+    # Keep only real users in assigned_rep_ids (drops junk like the "string"
+    # placeholder or ids from a different database).
+    if data.get("assigned_rep_ids"):
+        valid, _invalid = await repo.filter_existing_user_ids(session, data["assigned_rep_ids"])
+        data["assigned_rep_ids"] = valid
+    campaign = Campaign(**data)
     return await repo.save_campaign(session, campaign)
 
 
@@ -150,10 +158,22 @@ async def update_campaign(campaign_id: str, body: UpdateCampaignRequest, session
     """Edit campaign config (Campaign Config / Modify screens). Only provided
     fields change; the rest are left as-is."""
     campaign = await _require_campaign(session, campaign_id)
-    updates = body.model_dump(exclude_unset=True)
-    for field, value in updates.items():
-        setattr(campaign, field, value)
-    return await repo.save_campaign(session, campaign)
+
+    updates = {k: getattr(body, k) for k in body.model_fields_set}
+
+    # Clean assigned_rep_ids to real users only — this also self-heals a campaign
+    # whose list already contains junk (e.g. "string"): editing it fixes it.
+    if "assigned_rep_ids" in updates and updates["assigned_rep_ids"]:
+        valid, _invalid = await repo.filter_existing_user_ids(session, updates["assigned_rep_ids"])
+        updates["assigned_rep_ids"] = valid
+
+    merged = campaign.model_copy(update=updates)
+    validated = Campaign.model_validate(merged.model_dump())
+    # Also strip any pre-existing junk left on the campaign from before this fix.
+    if validated.assigned_rep_ids:
+        valid, _invalid = await repo.filter_existing_user_ids(session, validated.assigned_rep_ids)
+        validated.assigned_rep_ids = valid
+    return await repo.save_campaign(session, validated)
 
 
 async def _lifecycle_endpoint(session: AsyncSession, campaign_id: str, action) -> Campaign:
@@ -294,39 +314,95 @@ async def list_assets(campaign_id: str, session: AsyncSession = Depends(get_sess
 
 
 # --- research agent invocation ------------------------------------------------
-@router.post("/{campaign_id}/prospects/{link_id}/research")
-async def run_research(campaign_id: str, link_id: str, session: AsyncSession = Depends(get_session)) -> dict:
-    """Runs Research on one prospect and applies its decision via the state
-    machine. Agent only returns an AgentDecision; this endpoint transitions
-    stage and persists (agents decide, orchestrator executes)."""
-    campaign = await _require_campaign(session, campaign_id)
-    link = await _require_link(session, link_id)
+async def _run_research_on(session: AsyncSession, campaign: Campaign, link: CampaignProspectLink, personas: list[Persona]) -> dict:
+    """Run Research on one prospect + apply its decision. Shared by the single
+    and batch endpoints (agents decide, orchestrator executes)."""
     prospect = await _require_prospect(session, link.prospect_id)
-    personas = await repo.list_personas_for_campaign(session, campaign_id)
-
     context = AgentContext(campaign=campaign, prospect=prospect, link=link, personas=personas)
-    decision = research_agent.run(context)  # wrap in run_in_threadpool if this ever blocks
+    decision = research_agent.run(context)
     await repo.append_decision(session, decision)
-
-    # Enrichment may have mutated prospect.profile in place — persist it.
-    await repo.save_prospect(session, prospect)
+    await repo.save_prospect(session, prospect)  # enrichment may have mutated it
 
     if link.stage == FunnelStage.DISCOVERED:
         sm.transition(link, FunnelStage.RESEARCHED, campaign)
-
     link.fit_score = decision.details.get("fit_score")
     link.qualification_reasoning = decision.reasoning
     if decision.details.get("persona_id"):
         link.persona_id = decision.details["persona_id"]
-
     if decision.verdict == DecisionVerdict.QUALIFY:
         sm.transition(link, FunnelStage.QUALIFIED, campaign)
     elif decision.verdict == DecisionVerdict.REJECT:
         sm.transition(link, FunnelStage.REJECTED, campaign)
-    # NEEDS_REVIEW: stays at RESEARCHED.
-
+    # NEEDS_REVIEW stays at RESEARCHED.
     await repo.save_link(session, link)
     return {"link": link, "decision": decision}
+
+
+@router.post("/{campaign_id}/prospects/{link_id}/research")
+async def run_research(campaign_id: str, link_id: str, session: AsyncSession = Depends(get_session)) -> dict:
+    """Run Research on one prospect."""
+    campaign = await _require_campaign(session, campaign_id)
+    link = await _require_link(session, link_id)
+    personas = await repo.list_personas_for_campaign(session, campaign_id)
+    return await _run_research_on(session, campaign, link, personas)
+
+
+@router.post("/{campaign_id}/research-discovered")
+async def research_all_discovered(campaign_id: str, session: AsyncSession = Depends(get_session)) -> dict:
+    """Batch-run Research on every prospect still at 'discovered' — the button the
+    manager clicks after a CSV import. Processes sequentially to stay within
+    free-tier LLM rate limits; each prospect's decision is persisted as it goes."""
+    campaign = await _require_campaign(session, campaign_id)
+    personas = await repo.list_personas_for_campaign(session, campaign_id)
+    links = await repo.list_links_for_campaign(session, campaign_id)
+    discovered = [l for l in links if l.stage == FunnelStage.DISCOVERED]
+
+    qualified = rejected = needs_review = 0
+    for link in discovered:
+        result = await _run_research_on(session, campaign, link, personas)
+        verdict = result["decision"].verdict
+        if verdict == DecisionVerdict.QUALIFY:
+            qualified += 1
+        elif verdict == DecisionVerdict.REJECT:
+            rejected += 1
+        else:
+            needs_review += 1
+
+    return {"processed": len(discovered), "qualified": qualified, "rejected": rejected, "needs_review": needs_review}
+
+
+# --- CSV prospect import -----------------------------------------------------
+@router.post("/{campaign_id}/prospects/upload-csv")
+async def upload_prospects_csv(campaign_id: str, file: UploadFile = File(...), session: AsyncSession = Depends(get_session)) -> dict:
+    """Bulk-import prospects from a CSV. Flexible headers (name required),
+    de-duplicates against prospects already in the campaign. Imported prospects
+    land at 'discovered' — the manager then clicks 'Research all discovered'."""
+    if not (file.filename or "").lower().endswith(".csv"):
+        raise HTTPException(400, "Please upload a .csv file")
+    await _require_campaign(session, campaign_id)
+
+    raw = await file.read()
+    parsed = csv_import.parse_prospects_csv(raw)
+
+    existing = await repo.existing_dedupe_keys_for_campaign(session, campaign_id)
+    added = 0
+    skipped_duplicate = 0
+    for prospect in parsed.prospects:
+        key = prospect.dedupe_key()
+        if key in existing:
+            skipped_duplicate += 1
+            continue
+        existing.add(key)
+        await repo.save_prospect(session, prospect)
+        await repo.save_link(session, CampaignProspectLink(campaign_id=campaign_id, prospect_id=prospect.id))
+        added += 1
+
+    return {
+        "added": added,
+        "skipped_duplicate": skipped_duplicate,
+        "skipped_invalid": parsed.invalid_rows,
+        "total_rows": parsed.total_rows,
+    }
 
 
 @router.get("/{campaign_id}/prospects/{link_id}/decisions", response_model=list[AgentDecision])
@@ -355,9 +431,13 @@ async def run_personalize(campaign_id: str, link_id: str, session: AsyncSession 
 
     personas = await repo.list_personas_for_campaign(session, campaign_id)
     assets = await repo.list_assets_for_campaign(session, campaign_id)
+    total_today, usage_today = await repo.count_touches_today(session, campaign_id)
 
     agent = PersonalizeAgent(assets=assets)
-    context = AgentContext(campaign=campaign, prospect=prospect, link=link, personas=personas)
+    context = AgentContext(
+        campaign=campaign, prospect=prospect, link=link, personas=personas,
+        usage_today=usage_today, total_today=total_today,
+    )
     decision = agent.run(context)
     await repo.append_decision(session, decision)
     return {"decision": decision}

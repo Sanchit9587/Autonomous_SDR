@@ -21,6 +21,7 @@ class ProspectProfile(BaseModel):
     location: Optional[str] = None
     position: Optional[str] = None
     company_name: Optional[str] = None
+    company_size: Optional[int] = None       # employee count, when enrichment provides it
     work_email: Optional[str] = None
     phone_numbers: list[str] = Field(default_factory=list)
     enrichment_status: str = "pending"   # pending | ok | partial | not_found | error

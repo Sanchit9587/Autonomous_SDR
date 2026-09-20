@@ -16,6 +16,7 @@ export interface CreateCampaignBody {
   channel_policies?: Campaign["channel_policies"];
   default_channel_priority?: Campaign["default_channel_priority"];
   agent_settings?: Campaign["agent_settings"];
+  assigned_rep_ids?: string[];
 }
 
 export const campaignsApi = {

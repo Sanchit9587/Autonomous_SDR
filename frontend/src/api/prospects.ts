@@ -27,4 +27,32 @@ export const prospectsApi = {
       `/campaigns/${campaignId}/prospects/${linkId}/schedule-follow-up`,
       { delay_days }
     ),
+
+  researchDiscovered: (campaignId: string) =>
+    api.post<{ processed: number; qualified: number; rejected: number; needs_review: number }>(
+      `/campaigns/${campaignId}/research-discovered`
+    ),
+
+  uploadCsv: async (
+    campaignId: string,
+    file: File
+  ): Promise<{ added: number; skipped_duplicate: number; skipped_invalid: number; total_rows: number }> => {
+    // Multipart upload — can't go through the JSON api helper, so build the
+    // request directly (still injecting the JWT).
+    const form = new FormData();
+    form.append("file", file);
+    const base = import.meta.env.VITE_API_BASE_URL ?? "";
+    const token = localStorage.getItem("sdr_token");
+    const res = await fetch(`${base}/campaigns/${campaignId}/prospects/upload-csv`, {
+      method: "POST",
+      headers: token ? { Authorization: `Bearer ${token}` } : {},
+      body: form,
+    });
+    if (!res.ok) {
+      let detail = res.statusText;
+      try { detail = (await res.json()).detail ?? detail; } catch { /* ignore */ }
+      throw new Error(typeof detail === "string" ? detail : "Upload failed");
+    }
+    return res.json();
+  },
 };

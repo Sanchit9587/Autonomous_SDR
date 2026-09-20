@@ -1,7 +1,8 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useParams } from "react-router-dom";
 import { campaignsApi } from "../api/campaigns";
 import { prospectsApi } from "../api/prospects";
+import { repApi } from "../api/rep";
 import type { AgentDecision, Campaign, CampaignProspectLink, Prospect } from "../types";
 import { theme } from "../theme";
 import { Button, Card, ErrorText, Field, Input, Spinner, StatusBadge } from "../components/ui";
@@ -18,6 +19,9 @@ export function Prospects() {
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [busyLink, setBusyLink] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
+  const [batchBusy, setBatchBusy] = useState(false);
+  const fileRef = useRef<HTMLInputElement>(null);
 
   // add-prospect form
   const [name, setName] = useState("");
@@ -32,13 +36,18 @@ export function Prospects() {
 
   const load = () => {
     if (!campaignId) return;
-    campaignsApi.get(campaignId).then(setCampaign).catch(() => {});
-    // We don't have a "list prospects for campaign" endpoint yet, so we keep the
-    // rows we've added this session in local state. (Adding that endpoint is a
-    // small backend follow-up.)
-    setLoading(false);
+    setLoading(true);
+    Promise.all([campaignsApi.get(campaignId), repApi.prospects(campaignId)])
+      .then(([c, prospectRows]) => {
+        setCampaign(c);
+        setRows(prospectRows.map((pr) => ({ link: pr.link, prospect: pr.prospect })));
+      })
+      .catch((e) => setError(String(e.message)))
+      .finally(() => setLoading(false));
   };
   useEffect(load, [campaignId]);
+
+  const discoveredCount = rows.filter((r) => r.link.stage === "discovered").length;
 
   const addProspect = async () => {
     if (!campaignId || !name) return;
@@ -55,6 +64,28 @@ export function Prospects() {
       setRows((r) => [...r, { link, prospect: { ...prospect, id: link.prospect_id } }]);
       setName(""); setRole(""); setCompany(""); setHeadline(""); setLocation("");
     } catch (e) { setError(String((e as Error).message)); }
+  };
+
+  const uploadCsv = async (file: File) => {
+    if (!campaignId) return;
+    setError(null); setNotice(null);
+    try {
+      const r = await prospectsApi.uploadCsv(campaignId, file);
+      setNotice(`Imported ${r.added} prospect(s) · ${r.skipped_duplicate} duplicate(s) skipped · ${r.skipped_invalid} invalid row(s).`);
+      load();
+    } catch (e) { setError(String((e as Error).message)); }
+    finally { if (fileRef.current) fileRef.current.value = ""; }
+  };
+
+  const researchAllDiscovered = async () => {
+    if (!campaignId) return;
+    setBatchBusy(true); setError(null); setNotice(null);
+    try {
+      const r = await prospectsApi.researchDiscovered(campaignId);
+      setNotice(`Researched ${r.processed} prospect(s) — ${r.qualified} qualified, ${r.rejected} rejected, ${r.needs_review} need review.`);
+      load();
+    } catch (e) { setError(String((e as Error).message)); }
+    finally { setBatchBusy(false); }
   };
 
   const act = async (linkId: string, fn: () => Promise<unknown>, updater?: (l: CampaignProspectLink) => void) => {
@@ -111,6 +142,32 @@ export function Prospects() {
       <div style={{ color: theme.textMuted, fontSize: 12, marginBottom: 18 }}>{campaign?.name} · {campaign?.status}</div>
 
       {error && <ErrorText>{error}</ErrorText>}
+      {notice && (
+        <div style={{ color: theme.green, fontSize: 12, background: "rgba(74,222,128,0.1)", border: `1px solid rgba(74,222,128,0.3)`, borderRadius: 8, padding: "8px 12px", marginBottom: 14 }}>
+          {notice}
+        </div>
+      )}
+
+      <Card style={{ marginBottom: 16 }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap" }}>
+          <div>
+            <div style={{ color: "#fff", fontSize: 13, fontWeight: 700 }}>Import & research</div>
+            <div style={{ color: theme.textMuted, fontSize: 10, marginTop: 2 }}>
+              Upload a CSV of leads, then research all discovered prospects at once.
+            </div>
+          </div>
+          <span style={{ flex: 1 }} />
+          <input ref={fileRef} type="file" accept=".csv" style={{ display: "none" }}
+            onChange={(e) => { const f = e.target.files?.[0]; if (f) uploadCsv(f); }} />
+          <Button onClick={() => fileRef.current?.click()}>⬆ Upload CSV</Button>
+          <Button variant="primary" onClick={researchAllDiscovered} disabled={batchBusy || discoveredCount === 0}>
+            {batchBusy ? "Researching…" : `🔬 Research all discovered${discoveredCount ? ` (${discoveredCount})` : ""}`}
+          </Button>
+        </div>
+        <div style={{ color: theme.textFaint, fontSize: 9, marginTop: 10 }}>
+          CSV headers are flexible — e.g. name/full name, company, title/role, email, linkedin, location, employees. Only name is required.
+        </div>
+      </Card>
 
       <Card style={{ marginBottom: 20 }}>
         <div style={{ color: "#fff", fontSize: 13, fontWeight: 700, marginBottom: 12 }}>Add prospect</div>

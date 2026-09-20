@@ -9,6 +9,7 @@ python-dotenv>=1.0
 # API server (the whole orchestrator API runs on FastAPI; uvicorn serves it)
 fastapi>=0.110
 uvicorn>=0.29
+python-multipart>=0.0.9   # required by FastAPI for CSV file uploads
 
 # Research agent: RAG retriever (TF-IDF default backend) + scoring
 scikit-learn>=1.4
