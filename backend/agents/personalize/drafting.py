@@ -40,7 +40,8 @@ class DraftResult:
 
 class MessageDrafter(Protocol):
     def draft(self, *, prospect: Prospect, persona: Optional[Persona], channel: Channel,
-              context_type: str, research_reasoning: Optional[str]) -> DraftResult: ...
+              context_type: str, research_reasoning: Optional[str],
+              goals: Optional[list[str]] = None) -> DraftResult: ...
 
 
 def _example_grounding(persona: Optional[Persona], channel: Channel, query_text: str, k: int = 2) -> list[str]:
@@ -62,7 +63,7 @@ class TemplateOrGenericDrafter:
     """Zero-LLM drafter: uses the persona template if present, else the baked-in
     generic template. Always works, no keys, no network."""
 
-    def draft(self, *, prospect, persona, channel, context_type, research_reasoning) -> DraftResult:
+    def draft(self, *, prospect, persona, channel, context_type, research_reasoning, goals=None) -> DraftResult:
         fill_ctx = build_fill_context(prospect)
         template: Optional[MessageTemplate] = persona.template_for(channel) if persona else None
         if template is not None:
@@ -83,18 +84,18 @@ class LLMDrafter:
         self.fallback = fallback
         self.timeout = timeout
 
-    def draft(self, *, prospect, persona, channel, context_type, research_reasoning) -> DraftResult:
+    def draft(self, *, prospect, persona, channel, context_type, research_reasoning, goals=None) -> DraftResult:
         # If a template exists, prefer the deterministic path — no LLM needed.
         if persona and persona.template_for(channel) is not None:
             return self.fallback.draft(prospect=prospect, persona=persona, channel=channel,
-                                       context_type=context_type, research_reasoning=research_reasoning)
+                                       context_type=context_type, research_reasoning=research_reasoning, goals=goals)
         try:
-            return self._generate(prospect, persona, channel, context_type, research_reasoning)
+            return self._generate(prospect, persona, channel, context_type, research_reasoning, goals)
         except Exception:
             return self.fallback.draft(prospect=prospect, persona=persona, channel=channel,
-                                       context_type=context_type, research_reasoning=research_reasoning)
+                                       context_type=context_type, research_reasoning=research_reasoning, goals=goals)
 
-    def _generate(self, prospect, persona, channel, context_type, research_reasoning) -> DraftResult:
+    def _generate(self, prospect, persona, channel, context_type, research_reasoning, goals=None) -> DraftResult:
         p = prospect.profile
         tone = (persona.tone.value if persona else ToneEnum.PROFESSIONAL.value)
         tone_notes = (persona.tone_notes if persona and persona.tone_notes else "")
@@ -103,10 +104,18 @@ class LLMDrafter:
         examples_block = "\n".join(f"- {ex}" for ex in examples) if examples else "(none provided)"
 
         is_follow_up = context_type.startswith("follow_up")
+        goal_line = ""
+        if goals:
+            goal_line = (
+                f"Campaign goal(s): {', '.join(goals)}. Make the call-to-action drive toward "
+                f"the primary goal (e.g. book_meeting -> propose a call; signup/free_trial -> "
+                f"invite to sign up; sale -> move toward purchase).\n"
+            )
         prompt = (
             f"Write a {channel.value} outreach message to a sales prospect.\n"
             f"This is a {'follow-up' if is_follow_up else 'first-touch cold'} message.\n"
             f"Tone: {tone}. {tone_notes}\n"
+            f"{goal_line}"
             f"Prospect: {p.name}, {p.position or ''} at {p.company_name or ''}. Headline: {p.headline or ''}.\n"
             f"Why they fit (from research): {research_reasoning or 'n/a'}\n"
             f"Reference examples of messages that worked for this persona:\n{examples_block}\n\n"

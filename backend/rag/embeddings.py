@@ -37,11 +37,27 @@ class TfidfVectorizerBackend:
         self._fitted = False
 
     def fit(self, texts: list[str]) -> None:
-        if not texts:
+        # Drop blank docs upfront.
+        cleaned = [t for t in texts if t and t.strip()]
+        if not cleaned:
             self._fitted = False
             return
-        self._vectorizer.fit(texts)
-        self._fitted = True
+        try:
+            self._vectorizer.fit(cleaned)
+            self._fitted = True
+        except ValueError:
+            # "empty vocabulary; perhaps the documents only contain stop words" —
+            # the corpus was too thin to build any features. Retry once WITHOUT the
+            # stop-word filter so short/common text (e.g. a sparse ICP) still yields
+            # a vocabulary; if even that fails, degrade to "no semantic matches"
+            # rather than crashing the agent.
+            try:
+                from sklearn.feature_extraction.text import TfidfVectorizer
+                self._vectorizer = TfidfVectorizer(ngram_range=(1, 2))
+                self._vectorizer.fit(cleaned)
+                self._fitted = True
+            except ValueError:
+                self._fitted = False
 
     def transform(self, texts: list[str]) -> np.ndarray:
         if not self._fitted:

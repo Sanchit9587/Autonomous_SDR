@@ -50,14 +50,29 @@ def select_channel(
     persona: Optional[Persona],
     *,
     usage_today: Optional[dict[str, int]] = None,
+    total_today: int = 0,
     now: Optional[datetime] = None,
 ) -> ChannelChoice:
     """Walk the effective channel priority; pick the first channel that is
     enabled, under its daily limit, and within working hours. If a channel is
     the best pick but outside its hours, return it with a scheduled_time for
-    the next window open instead of send_now."""
+    the next window open instead of send_now.
+
+    Respects two limits, both fed from actual sent-touch counts:
+      * per-channel `daily_limit` (skip that channel if hit today)
+      * campaign-wide `pace_per_day` (defer everything to tomorrow if hit)
+    """
     now = now or datetime.now(timezone.utc)
     usage_today = usage_today or {}
+
+    # Campaign-wide pace cap: if today's total touches already hit the pace,
+    # nothing more goes out today — defer to the start of tomorrow.
+    if campaign.pace_per_day is not None and total_today >= campaign.pace_per_day:
+        tomorrow = (now + timedelta(days=1)).replace(hour=9, minute=0, second=0, microsecond=0)
+        return ChannelChoice(
+            channel=None, send_now=False, scheduled_time=tomorrow.isoformat(),
+            reason=f"daily pace reached ({total_today}/{campaign.pace_per_day}) — deferring to tomorrow",
+        )
 
     default_order = campaign.default_channel_priority or [p.channel for p in campaign.channel_policies]
     order = persona.effective_channel_priority(default_order) if persona else default_order
@@ -70,10 +85,10 @@ def select_channel(
     for channel in order:
         policy = _policy_for(campaign, channel)
         if policy is not None and not policy.enabled:
-            continue
+            continue  # channel switched off -> reroute to next enabled channel
         if policy is not None and policy.daily_limit is not None:
             if usage_today.get(channel.value, 0) >= policy.daily_limit:
-                continue  # over limit today, try next channel
+                continue  # over this channel's limit today, try next channel
 
         hours = _parse_working_hours(policy.working_hours) if policy else None
         if hours is not None:

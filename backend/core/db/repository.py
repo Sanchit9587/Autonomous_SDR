@@ -143,6 +143,26 @@ async def list_turns_for_prospect(session: AsyncSession, campaign_id: str, prosp
     return [mp.turn_to_model(r) for r in rows]
 
 
+async def count_touches_today(session: AsyncSession, campaign_id: str) -> tuple[int, dict[str, int]]:
+    """Count today's OUTBOUND conversation turns for a campaign (= sent touches),
+    returning (total, per-channel). This is the source of truth for pace and
+    per-channel daily limits — derived from real sent turns, not a separate
+    counter that could drift."""
+    from datetime import datetime, timezone
+    start_of_day = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+    rows = (await session.execute(
+        select(t.ConversationTurnORM.channel).where(
+            t.ConversationTurnORM.campaign_id == campaign_id,
+            t.ConversationTurnORM.direction == "outbound",
+            t.ConversationTurnORM.created_at >= start_of_day,
+        )
+    )).scalars().all()
+    per_channel: dict[str, int] = {}
+    for ch in rows:
+        per_channel[ch] = per_channel.get(ch, 0) + 1
+    return len(rows), per_channel
+
+
 # --- suppression ------------------------------------------------------------
 async def add_suppression(session: AsyncSession, key: str) -> None:
     await session.merge(t.SuppressionEntryORM(key=key.strip().lower()))
@@ -185,3 +205,71 @@ async def list_users(session: AsyncSession):
     from core.db import mappers as _mp
     rows = (await session.execute(select(t.UserORM))).scalars().all()
     return [_mp.user_to_model(r) for r in rows]
+
+
+async def filter_existing_user_ids(session: AsyncSession, ids: list[str]) -> tuple[list[str], list[str]]:
+    """Split ids into (valid, invalid) by which ones are real users. Used to keep
+    junk (e.g. the OpenAPI placeholder 'string', or ids from a stale/other DB)
+    out of assigned_rep_ids."""
+    if not ids:
+        return [], []
+    rows = (await session.execute(
+        select(t.UserORM.id).where(t.UserORM.id.in_(ids))
+    )).scalars().all()
+    existing = set(rows)
+    # Preserve order, dedupe.
+    valid, invalid, seen = [], [], set()
+    for i in ids:
+        if i in seen:
+            continue
+        seen.add(i)
+        (valid if i in existing else invalid).append(i)
+    return valid, invalid
+
+
+# --- rep-facing read queries -------------------------------------------------
+async def list_recent_decisions(session: AsyncSession, campaign_id: Optional[str] = None, limit: int = 50) -> list[AgentDecision]:
+    """Chronological (newest-first) agent decisions — powers the Live Activity feed.
+    Optionally scoped to one campaign."""
+    q = select(t.AgentDecisionORM).order_by(t.AgentDecisionORM.created_at.desc()).limit(limit)
+    if campaign_id:
+        q = q.where(t.AgentDecisionORM.campaign_id == campaign_id)
+    from core.db import mappers as _mp
+    rows = (await session.execute(q)).scalars().all()
+    return [_mp.decision_to_model(r) for r in rows]
+
+
+async def list_escalations(session: AsyncSession, campaign_id: Optional[str] = None, limit: int = 100) -> list[AgentDecision]:
+    """Decisions where an agent escalated to a human — the Escalations queue."""
+    q = (select(t.AgentDecisionORM)
+         .where(t.AgentDecisionORM.verdict == "escalate")
+         .order_by(t.AgentDecisionORM.created_at.desc()).limit(limit))
+    if campaign_id:
+        q = q.where(t.AgentDecisionORM.campaign_id == campaign_id)
+    from core.db import mappers as _mp
+    rows = (await session.execute(q)).scalars().all()
+    return [_mp.decision_to_model(r) for r in rows]
+
+
+async def list_prospects_for_campaign(session: AsyncSession, campaign_id: str) -> list[tuple[CampaignProspectLink, Prospect]]:
+    """Every prospect in a campaign, paired with its funnel link — for the
+    Prospects list. Joins links to prospects in one query."""
+    from core.db import mappers as _mp
+    rows = (await session.execute(
+        select(t.CampaignProspectLinkORM, t.ProspectORM)
+        .join(t.ProspectORM, t.CampaignProspectLinkORM.prospect_id == t.ProspectORM.id)
+        .where(t.CampaignProspectLinkORM.campaign_id == campaign_id)
+        .order_by(t.CampaignProspectLinkORM.created_at.desc())
+    )).all()
+    return [(_mp.link_to_model(link), _mp.prospect_to_model(pros)) for link, pros in rows]
+
+
+async def get_prospect_for_link(session: AsyncSession, link: CampaignProspectLink) -> Optional[Prospect]:
+    return await get_prospect(session, link.prospect_id)
+
+
+async def existing_dedupe_keys_for_campaign(session: AsyncSession, campaign_id: str) -> set[str]:
+    """Dedupe keys (linkedin_url / work_email / name, lowercased) of prospects
+    already in a campaign — used to skip duplicates on CSV import."""
+    pairs = await list_prospects_for_campaign(session, campaign_id)
+    return {prospect.dedupe_key() for _link, prospect in pairs}

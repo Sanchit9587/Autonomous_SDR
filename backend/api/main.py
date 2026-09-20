@@ -12,10 +12,13 @@ from sqlalchemy import text
 from core.db.engine import get_engine
 from auth.router import router as auth_router
 from orchestrator.api import router as campaigns_router
+from orchestrator.rep_api import router as rep_router
 from orchestrator.scheduler import shutdown_scheduler, start_scheduler
 
 load_dotenv()
 
+# Vercel is serverless — a long-lived background scheduler can't run there, so
+# it's only started in a normal (always-on) process.
 IS_VERCEL = os.getenv("VERCEL") == "1"
 
 
@@ -32,7 +35,7 @@ async def lifespan(app: FastAPI):
         ) from exc
 
     if not IS_VERCEL:
-        start_scheduler()
+        start_scheduler()  # follow-up timers (persistent Postgres job store)
 
     try:
         yield
@@ -62,6 +65,7 @@ app.add_middleware(
 
 app.include_router(auth_router)
 app.include_router(campaigns_router)
+app.include_router(rep_router)
 
 
 @app.get("/health")

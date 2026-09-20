@@ -30,6 +30,10 @@ class AgentContext(BaseModel):
     inbound_message: Optional[str] = None         # the raw reply text, when trigger == "reply"
     conversation_history: list[ConversationTurn] = []
 
+    # Pace/limit awareness (optional; used by Personalize channel selection):
+    usage_today: dict[str, int] = {}              # outbound touches per channel today
+    total_today: int = 0                          # total outbound touches today (campaign-wide)
+
 
 class Agent(ABC):
     @abstractmethod

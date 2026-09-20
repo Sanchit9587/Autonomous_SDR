@@ -32,6 +32,15 @@ async def me(user: User = Depends(get_current_user)) -> User:
     return user
 
 
+@router.get("/users", response_model=list[User])
+async def list_users(
+    session: AsyncSession = Depends(get_session),
+    _user: User = Depends(require_role(UserRole.MANAGER)),
+) -> list[User]:
+    """List users (Manager/Admin) — powers the campaign Team member picker."""
+    return await repo.list_users(session)
+
+
 @router.post("/register", response_model=User)
 async def register(
     body: UserCreate,

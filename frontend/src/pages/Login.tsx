@@ -17,8 +17,8 @@ export function Login() {
     setBusy(true);
     try {
       const user = await login(email, password);
-      // Managers → control plane. Reps would go to a rep dashboard (Tier 2).
-      navigate(user.role === "rep" ? "/campaigns" : "/campaigns");
+      // Managers → control plane; reps → operational app.
+      navigate(user.role === "rep" ? "/rep" : "/campaigns");
     } catch (e) {
       setError(e instanceof ApiError ? e.message : "Login failed");
     } finally {

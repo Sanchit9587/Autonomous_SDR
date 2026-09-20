@@ -52,6 +52,18 @@ def evaluate_icp_rules(profile: ProspectProfile, icp: ICPFilter) -> RuleResult:
         else:
             failed.append("keywords")
 
+    # Company size: only evaluated when BOTH a range is configured AND the prospect
+    # actually has a size (from enrichment). Missing size is not penalised — we
+    # don't reject a prospect just because we lack the data.
+    if (icp.company_size_min is not None or icp.company_size_max is not None) and profile.company_size is not None:
+        evaluated += 1
+        lo = icp.company_size_min if icp.company_size_min is not None else 0
+        hi = icp.company_size_max if icp.company_size_max is not None else 10**9
+        if lo <= profile.company_size <= hi:
+            matched.append("company_size")
+        else:
+            failed.append("company_size")
+
     # Exclusion is a hard stop, independent of the score below.
     if icp.exclusion_criteria:
         exclusion_terms = [t.strip() for t in icp.exclusion_criteria.split(",") if t.strip()]

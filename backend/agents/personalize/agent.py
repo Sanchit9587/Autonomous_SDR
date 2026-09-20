@@ -35,8 +35,11 @@ class PersonalizeAgent(Agent):
         persona = self._resolve_persona(context)
         context_type = "cold_open"  # orchestrator overrides to 'follow_up_N' when re-invoked for follow-ups
 
-        # Step 1 + 2: channel + timing
-        choice = select_channel(context.campaign, persona)
+        # Step 1 + 2: channel + timing (respecting per-channel + campaign pace limits)
+        choice = select_channel(
+            context.campaign, persona,
+            usage_today=context.usage_today, total_today=context.total_today,
+        )
         if choice.channel is None:
             return AgentDecision(
                 campaign_id=context.campaign.id, prospect_id=context.prospect.id,
@@ -45,10 +48,11 @@ class PersonalizeAgent(Agent):
                 details={"channel": None, "scheduled_time": None, "context_type": context_type},
             )
 
-        # Step 3: draft
+        # Step 3: draft (goal-aware — campaign goals shape the call-to-action)
         draft = self.drafter.draft(
             prospect=context.prospect, persona=persona, channel=choice.channel,
             context_type=context_type, research_reasoning=context.link.qualification_reasoning,
+            goals=context.campaign.goals,
         )
 
         # Step 4: asset selection (best-matching, channel-attachable, may be None)
