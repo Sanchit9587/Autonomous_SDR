@@ -32,6 +32,7 @@ export function CampaignSummary() {
         <div style={{ display: "flex", gap: 10 }}>
           <Button onClick={() => navigate(`/campaigns/${c.id}/edit`)}>✎ Modify</Button>
           <Button onClick={() => navigate(`/campaigns/${c.id}/prospects`)}>Prospects</Button>
+          <Button onClick={() => navigate(`/campaigns/${c.id}/choreography`)}>🧬 Choreography</Button>
           {c.status === "draft" && <Button variant="primary" onClick={async () => { await campaignsApi.activate(c.id); navigate(0); }}>🚀 Launch</Button>}
         </div>
       </div>

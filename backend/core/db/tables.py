@@ -54,6 +54,7 @@ class CampaignORM(TimestampMixin, Base):
 
     system_prompt_version: Mapped[Optional[str]] = mapped_column(String, nullable=True)
     assigned_rep_ids: Mapped[list] = mapped_column(JSON, default=list)
+    choreography: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
 
 
 class ProspectORM(TimestampMixin, Base):

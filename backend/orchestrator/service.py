@@ -26,6 +26,7 @@ from core.models import (
     FunnelStage,
     Prospect,
 )
+from integrations.dronahq_events import build_meeting_request_message, request_event_creation
 from orchestrator import state_machine as sm
 
 converse_agent = ConverseAgent()
@@ -82,7 +83,42 @@ async def process_converse(
         await repo.append_decision(session, p_decision)
         follow_up_draft = p_decision
 
-    return {"decision": decision, "personalize_followup": follow_up_draft}
+    event_management_result: Optional[dict] = None
+    if next_action == "advance_meeting":
+        event_management_result = await request_calendar_event(
+            session, campaign=campaign, prospect=prospect, inbound_message=inbound_message or "",
+        )
+
+    return {"decision": decision, "personalize_followup": follow_up_draft, "event_management_result": event_management_result}
+
+
+async def request_calendar_event(
+    session: AsyncSession, *, campaign: Campaign, prospect: Prospect, inbound_message: str,
+) -> dict:
+    """Called when Converse's policy fires `advance_meeting` (a prospect asked
+    to meet). Hands off to DronaHQ's Event Management Agent — see
+    integrations/dronahq_events.py for exactly what that does and does not
+    do today (it's a real, tested webhook call; the calendar/notification
+    tools behind it still need someone to authorize them in DronaHQ Studio).
+    Records the agent's reply as a conversation turn either way, so it shows
+    up in the dashboard instead of disappearing silently.
+    """
+    message = build_meeting_request_message(
+        prospect_name=prospect.profile.name, company=prospect.profile.company_name,
+        campaign_name=campaign.name, inbound_message=inbound_message,
+    )
+    result = await request_event_creation(message)
+
+    note = (
+        f"[DronaHQ Event Management Agent] request sent (thread {result.thread_id})"
+        if result.ok else f"[DronaHQ Event Management Agent] request failed: {result.error}"
+    )
+    await repo.append_turn(session, ConversationTurn(
+        campaign_id=campaign.id, prospect_id=prospect.id,
+        channel=Channel.EMAIL, direction=Direction.OUTBOUND,
+        content=note, agent_name="dronahq_event_management",
+    ))
+    return {"ok": result.ok, "thread_id": result.thread_id, "run_id": result.run_id, "error": result.error}
 
 
 async def fire_follow_up(session: AsyncSession, campaign_id: str, link_id: str) -> dict:

@@ -179,6 +179,22 @@ async def count_touches_total(session: AsyncSession, campaign_id: str) -> dict[s
     return per_channel
 
 
+async def count_turns_by_channel_and_direction(session: AsyncSession, campaign_id: str) -> dict[str, dict[str, int]]:
+    """{channel: {"outbound": n, "inbound": n}} for a campaign, all-time — the
+    reply-rate basis for the generative-edits 'best channel' signal (inbound
+    ÷ outbound), not something any single existing query already returns."""
+    rows = (await session.execute(
+        select(t.ConversationTurnORM.channel, t.ConversationTurnORM.direction).where(
+            t.ConversationTurnORM.campaign_id == campaign_id,
+        )
+    )).all()
+    per_channel: dict[str, dict[str, int]] = {}
+    for channel, direction in rows:
+        bucket = per_channel.setdefault(channel, {"outbound": 0, "inbound": 0})
+        bucket[direction] = bucket.get(direction, 0) + 1
+    return per_channel
+
+
 # --- suppression ------------------------------------------------------------
 async def add_suppression(session: AsyncSession, key: str) -> None:
     await session.merge(t.SuppressionEntryORM(key=key.strip().lower()))

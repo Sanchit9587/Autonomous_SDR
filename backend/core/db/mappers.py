@@ -33,6 +33,7 @@ def campaign_to_orm(m: Campaign) -> t.CampaignORM:
         target_scale=m.target_scale, pace_per_day=m.pace_per_day, goals=m.goals,
         sources=m.sources, connector_configs=m.connector_configs,
         system_prompt_version=m.system_prompt_version, assigned_rep_ids=m.assigned_rep_ids,
+        choreography=m.choreography,
         created_at=m.created_at, updated_at=m.updated_at,
     )
 
@@ -48,7 +49,8 @@ def campaign_to_model(o: t.CampaignORM) -> Campaign:
         "sources": o.sources or ["apollo", "linkedin"],
         "connector_configs": o.connector_configs or {},
         "system_prompt_version": o.system_prompt_version,
-        "assigned_rep_ids": o.assigned_rep_ids, "created_at": o.created_at, "updated_at": o.updated_at,
+        "assigned_rep_ids": o.assigned_rep_ids, "choreography": o.choreography,
+        "created_at": o.created_at, "updated_at": o.updated_at,
     })
 
 

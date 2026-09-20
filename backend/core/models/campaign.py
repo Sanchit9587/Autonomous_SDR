@@ -73,5 +73,14 @@ class Campaign(TimestampedModel):
     system_prompt_version: Optional[str] = None      # campaign-level PromptVersion.id
     assigned_rep_ids: list[str] = Field(default_factory=list)
 
+    # The visual Choreography Builder's saved graph: {"nodes": [...], "edges": [...]}
+    # in React Flow's native shape. Not yet interpreted by anything — the campaign
+    # still runs on the hardcoded state machine + follow-up policy (see
+    # orchestrator/state_machine.py). This is Phase 1 (build + persist the graph);
+    # an executor that actually runs campaigns off this graph is a separate,
+    # larger piece of work. Left as a loose dict rather than a typed model since
+    # the schema is still React Flow's, not ours, until the executor exists.
+    choreography: Optional[dict] = None
+
     def is_live(self) -> bool:
         return self.status == CampaignStatus.LIVE
