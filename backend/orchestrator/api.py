@@ -50,6 +50,7 @@ from orchestrator import scheduler as sched
 from orchestrator import service
 from orchestrator import state_machine as sm
 from orchestrator.conflict_resolver import detect_cross_campaign_conflicts, find_duplicate_prospects
+from orchestrator.suggestions import compute_campaign_metrics, generate_suggestions
 
 # The entire /campaigns API is the Manager control plane, so the whole router
 # requires an authenticated Manager (Admin passes too). Rep-facing read views
@@ -314,6 +315,70 @@ async def create_asset(campaign_id: str, asset: CampaignAsset, session: AsyncSes
 async def list_assets(campaign_id: str, session: AsyncSession = Depends(get_session)) -> list[CampaignAsset]:
     await _require_campaign(session, campaign_id)
     return await repo.list_assets_for_campaign(session, campaign_id)
+
+
+# --- generative edits ---------------------------------------------------------
+class GenerativeEditsResponse(BaseModel):
+    campaign_id: str
+    conversions: int
+    best_channel: Optional[str]
+    best_channel_reply_rate: Optional[float]
+    open_escalations: int
+    stale_discovered: int
+    suggestions: list[dict]
+
+
+@router.get("/{campaign_id}/generative-edits", response_model=GenerativeEditsResponse)
+async def get_generative_edits(campaign_id: str, session: AsyncSession = Depends(get_session)) -> GenerativeEditsResponse:
+    """Computed fresh on every call — there's nothing to regenerate that isn't
+    already a live function of current campaign data, so 'Regenerate' on the
+    frontend is just calling this again. Nothing here is persisted or applied;
+    applying a suggestion means the frontend sends its diff/action to the
+    existing PATCH /campaigns/{id} or action endpoint, same as a human would.
+    """
+    campaign = await _require_campaign(session, campaign_id)
+    links = await repo.list_links_for_campaign(session, campaign_id)
+    turns_by_channel = await repo.count_turns_by_channel_and_direction(session, campaign_id)
+    escalations = await repo.list_escalations(session, campaign_id)
+
+    metrics = compute_campaign_metrics(links, turns_by_channel, len(escalations))
+    suggestions = generate_suggestions(campaign, links, turns_by_channel, len(escalations))
+
+    return GenerativeEditsResponse(
+        campaign_id=campaign_id,
+        conversions=metrics.conversions,
+        best_channel=metrics.best_channel,
+        best_channel_reply_rate=metrics.best_channel_reply_rate,
+        open_escalations=metrics.open_escalations,
+        stale_discovered=metrics.stale_discovered,
+        suggestions=[s.__dict__ for s in suggestions],
+    )
+
+
+# --- choreography (visual sequence builder) -----------------------------------
+class ChoreographyBody(BaseModel):
+    """React Flow's native graph shape — {nodes, edges} — stored as-is.
+    Not validated node-by-node here: there's no executor yet to define what
+    'valid' means (see Campaign.choreography's docstring), so this endpoint's
+    job is just reliable persistence, not correctness-checking a spec that
+    doesn't exist yet."""
+    nodes: list[dict] = []
+    edges: list[dict] = []
+
+
+@router.get("/{campaign_id}/choreography", response_model=ChoreographyBody)
+async def get_choreography(campaign_id: str, session: AsyncSession = Depends(get_session)) -> ChoreographyBody:
+    campaign = await _require_campaign(session, campaign_id)
+    saved = campaign.choreography or {}
+    return ChoreographyBody(nodes=saved.get("nodes", []), edges=saved.get("edges", []))
+
+
+@router.put("/{campaign_id}/choreography", response_model=ChoreographyBody)
+async def save_choreography(campaign_id: str, body: ChoreographyBody, session: AsyncSession = Depends(get_session)) -> ChoreographyBody:
+    campaign = await _require_campaign(session, campaign_id)
+    updated = campaign.model_copy(update={"choreography": {"nodes": body.nodes, "edges": body.edges}})
+    await repo.save_campaign(session, updated)
+    return body
 
 
 # --- research agent invocation ------------------------------------------------

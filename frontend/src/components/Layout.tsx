@@ -8,6 +8,7 @@ const NAV = [
   { to: "/campaigns", label: "Campaigns", icon: "🚩" },
   { to: "/profiles", label: "Customer Profiles", icon: "👤" },
   { to: "/assets", label: "Assets", icon: "📁" },
+  { to: "/generative-edits", label: "Generative Edits", icon: "✨" },
 ];
 
 function Sidebar() {

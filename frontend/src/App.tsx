@@ -10,6 +10,8 @@ import { CustomerProfiles } from "./pages/CustomerProfiles";
 import { Assets } from "./pages/Assets";
 import { Prospects } from "./pages/Prospects";
 import { Dashboard } from "./pages/Dashboard";
+import { ChoreographyBuilderPage } from "./pages/ChoreographyBuilder";
+import { GenerativeEditsPage } from "./pages/GenerativeEdits";
 import { RepDashboard } from "./pages/rep/RepDashboard";
 import { LiveActivity } from "./pages/rep/LiveActivity";
 import { Escalations } from "./pages/rep/Escalations";
@@ -44,8 +46,10 @@ export function App() {
       <Route path="/campaigns/:id" element={<Managed><CampaignSummary /></Managed>} />
       <Route path="/campaigns/:id/edit" element={<Managed><CampaignConfiguration mode="edit" /></Managed>} />
       <Route path="/campaigns/:id/prospects" element={<Managed><Prospects /></Managed>} />
+      <Route path="/campaigns/:id/choreography" element={<ProtectedRoute roles={["manager"]}><ChoreographyBuilderPage /></ProtectedRoute>} />
       <Route path="/profiles" element={<Managed><CustomerProfiles /></Managed>} />
       <Route path="/assets" element={<Managed><Assets /></Managed>} />
+      <Route path="/generative-edits" element={<Managed><GenerativeEditsPage /></Managed>} />
 
       <Route path="/rep" element={<RepView><RepDashboard /></RepView>} />
       <Route path="/rep/activity" element={<RepView><LiveActivity /></RepView>} />
