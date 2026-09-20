@@ -1,0 +1,783 @@
+From abd297b3fe2b1f93f24b2c9037b84cc010e604e9 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sun, 20 Sep 2026 16:18:27 +0000
+Subject: [PATCH] Book meetings automatically: Meet link email + admin calendar
+ event
+
+Converse already detected when a prospect wants to meet (the
+"meeting_request" outcome in agents/converse/policy.py) but nothing acted
+on it beyond moving the funnel stage. This wires up the missing half:
+
+- integrations/calendar.py: creates a Google Calendar event with an
+  auto-generated Meet link on the admin's calendar (service account +
+  domain-wide delegation). Falls back to a stub Meet link when
+  GOOGLE_SERVICE_ACCOUNT_JSON isn't set, so the app still runs out of the
+  box, matching this repo's existing dev-fallback pattern.
+- integrations/mailer.py: emails the participant that Meet link plus a
+  reminder of when the meeting is. Falls back to logging the email when
+  SMTP isn't configured.
+- orchestrator/meeting_scheduler.py: picks a default slot, resolves which
+  admin's calendar to use (env override -> ADMIN-role user -> campaign
+  owner), and ties the two integrations together. Wired into
+  orchestrator/service.py's process_converse for the "advance_meeting"
+  action.
+- CampaignProspectLink gains meeting_link/meeting_scheduled_at/
+  calendar_event_id (model + table + mapper + Alembic migration) so the
+  booking is visible wherever the link already is.
+- backend/.env.example documents the new (and existing) env vars.
+- backend/tests/test_meeting_scheduler.py covers the dev-fallback paths
+  and the default-slot calculation.
+
+Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SgzHaZMdTz8QwK29BfaBJB
+---
+ .gitignore                                    |   3 +
+ backend/.env.example                          |  44 ++++++
+ ...6c_add_meeting_fields_to_prospect_links.py |  32 ++++
+ backend/core/db/mappers.py                    |   4 +
+ backend/core/db/tables.py                     |   3 +
+ backend/core/models/prospect.py               |  12 +-
+ backend/integrations/__init__.py              |   5 +
+ backend/integrations/calendar.py              | 143 ++++++++++++++++++
+ backend/integrations/mailer.py                | 111 ++++++++++++++
+ backend/orchestrator/meeting_scheduler.py     | 137 +++++++++++++++++
+ backend/orchestrator/service.py               |  11 +-
+ backend/pytest.ini                            |   2 +
+ backend/tests/test_meeting_scheduler.py       |  81 ++++++++++
+ requirements.txt                              |   8 +
+ 14 files changed, 594 insertions(+), 2 deletions(-)
+ create mode 100644 backend/.env.example
+ create mode 100644 backend/alembic/versions/81e36fc12b6c_add_meeting_fields_to_prospect_links.py
+ create mode 100644 backend/integrations/__init__.py
+ create mode 100644 backend/integrations/calendar.py
+ create mode 100644 backend/integrations/mailer.py
+ create mode 100644 backend/orchestrator/meeting_scheduler.py
+ create mode 100644 backend/pytest.ini
+ create mode 100644 backend/tests/test_meeting_scheduler.py
+
+diff --git a/.gitignore b/.gitignore
+index ec844b6..42b5aeb 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -1,5 +1,8 @@
+ venv/
+ backend/.env
++__pycache__/
++*.pyc
++.pytest_cache/
+ backend/alembic/__pycache__/
+ backend/core/db/__pycache__/
+ backend/core/models/__pycache__/
+diff --git a/backend/.env.example b/backend/.env.example
+new file mode 100644
+index 0000000..941b8f6
+--- /dev/null
++++ b/backend/.env.example
+@@ -0,0 +1,44 @@
++# Copy to backend/.env and fill in. Nothing here is loaded from git (see .gitignore).
++
++# --- Database (Prisma Postgres) ---------------------------------------------
++DATABASE_URL=   # pooled connection string, used by the running app
++DIRECT_URL=     # direct connection string, used by Alembic migrations + the APScheduler jobstore
++# SQL_ECHO=true  # uncomment to log every SQL statement (debugging only)
++
++# --- Auth --------------------------------------------------------------------
++JWT_SECRET=change-me   # falls back to an insecure dev default if unset — set this in prod
++
++# --- Research agent (optional) -----------------------------------------------
++# GROQ_API_KEY=
++# GEMINI_API_KEY=
++# RESEARCH_EMBEDDING_BACKEND=sentence_transformers   # default is TF-IDF; uncomment to upgrade
++
++# --- Meeting booking (Converse "meeting_request" -> orchestrator/meeting_scheduler.py) ---
++# Without these, meetings still "book": a stub Google Meet link is generated and the
++# participant email is logged instead of sent, so the pipeline runs end to end in dev.
++
++# Google Calendar: a service account with domain-wide delegation, so it can create
++# the event directly on the admin's calendar (acting *as* them) rather than needing
++# each admin to individually OAuth. Paste the service-account JSON key inline, or a
++# path to the key file. See https://developers.google.com/identity/protocols/oauth2/service-account
++# GOOGLE_SERVICE_ACCOUNT_JSON=
++
++# Which admin's calendar the meeting is booked on. If unset, falls back to the first
++# ADMIN-role user in the database (see backend/scripts/seed_users.py), then the
++# campaign's owner.
++# ADMIN_CALENDAR_EMAIL=admin@sdrhq.io
++# ADMIN_CALENDAR_NAME=Admin
++
++# Default slot for the booked meeting (a human can always move it afterwards).
++# MEETING_DEFAULT_LEAD_DAYS=1      # business days out
++# MEETING_DEFAULT_HOUR_UTC=15
++# MEETING_DURATION_MINUTES=30
++
++# SMTP: sends the participant their Google Meet link + a reminder. Works as-is with
++# Gmail SMTP (smtp.gmail.com:587 + an app password) or any standard SMTP relay.
++# SMTP_HOST=smtp.gmail.com
++# SMTP_PORT=587
++# SMTP_USER=
++# SMTP_PASSWORD=
++# SMTP_FROM=              # defaults to SMTP_USER
++# SMTP_USE_TLS=true
+diff --git a/backend/alembic/versions/81e36fc12b6c_add_meeting_fields_to_prospect_links.py b/backend/alembic/versions/81e36fc12b6c_add_meeting_fields_to_prospect_links.py
+new file mode 100644
+index 0000000..c34ff86
+--- /dev/null
++++ b/backend/alembic/versions/81e36fc12b6c_add_meeting_fields_to_prospect_links.py
+@@ -0,0 +1,32 @@
++"""add meeting fields to prospect links
++
++Revision ID: 81e36fc12b6c
++Revises: c709a5502bee
++Create Date: 2026-09-20 20:30:00.000000
++"""
++from typing import Sequence, Union
++
++from alembic import op
++import sqlalchemy as sa
++
++
++revision: str = '81e36fc12b6c'
++down_revision: Union[str, None] = 'c709a5502bee'
++branch_labels: Union[str, Sequence[str], None] = None
++depends_on: Union[str, Sequence[str], None] = None
++
++
++def upgrade() -> None:
++    # ### commands auto generated by Alembic - please adjust! ###
++    op.add_column('campaign_prospect_links', sa.Column('meeting_link', sa.String(), nullable=True))
++    op.add_column('campaign_prospect_links', sa.Column('meeting_scheduled_at', sa.String(), nullable=True))
++    op.add_column('campaign_prospect_links', sa.Column('calendar_event_id', sa.String(), nullable=True))
++    # ### end Alembic commands ###
++
++
++def downgrade() -> None:
++    # ### commands auto generated by Alembic - please adjust! ###
++    op.drop_column('campaign_prospect_links', 'calendar_event_id')
++    op.drop_column('campaign_prospect_links', 'meeting_scheduled_at')
++    op.drop_column('campaign_prospect_links', 'meeting_link')
++    # ### end Alembic commands ###
+diff --git a/backend/core/db/mappers.py b/backend/core/db/mappers.py
+index 2c43717..c6cb6aa 100644
+--- a/backend/core/db/mappers.py
++++ b/backend/core/db/mappers.py
+@@ -69,6 +69,8 @@ def link_to_orm(m: CampaignProspectLink) -> t.CampaignProspectLinkORM:
+         human_approved=m.human_approved, human_approved_by=m.human_approved_by,
+         last_contacted_channel=m.last_contacted_channel, contact_count=m.contact_count,
+         follow_up_owed=m.follow_up_owed, next_follow_up_at=m.next_follow_up_at,
++        meeting_link=m.meeting_link, meeting_scheduled_at=m.meeting_scheduled_at,
++        calendar_event_id=m.calendar_event_id,
+         created_at=m.created_at, updated_at=m.updated_at,
+     )
+ 
+@@ -80,6 +82,8 @@ def link_to_model(o: t.CampaignProspectLinkORM) -> CampaignProspectLink:
+         "human_approved": o.human_approved, "human_approved_by": o.human_approved_by,
+         "last_contacted_channel": o.last_contacted_channel, "contact_count": o.contact_count,
+         "follow_up_owed": o.follow_up_owed, "next_follow_up_at": o.next_follow_up_at,
++        "meeting_link": o.meeting_link, "meeting_scheduled_at": o.meeting_scheduled_at,
++        "calendar_event_id": o.calendar_event_id,
+         "created_at": o.created_at, "updated_at": o.updated_at,
+     })
+ 
+diff --git a/backend/core/db/tables.py b/backend/core/db/tables.py
+index 3b9c2ed..84f325a 100644
+--- a/backend/core/db/tables.py
++++ b/backend/core/db/tables.py
+@@ -79,6 +79,9 @@ class CampaignProspectLinkORM(TimestampMixin, Base):
+     contact_count: Mapped[int] = mapped_column(Integer, default=0)
+     follow_up_owed: Mapped[bool] = mapped_column(Boolean, default=False)
+     next_follow_up_at: Mapped[Optional[str]] = mapped_column(String, nullable=True)
++    meeting_link: Mapped[Optional[str]] = mapped_column(String, nullable=True)
++    meeting_scheduled_at: Mapped[Optional[str]] = mapped_column(String, nullable=True)
++    calendar_event_id: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+ 
+ 
+ class PersonaORM(TimestampMixin, Base):
+diff --git a/backend/core/models/prospect.py b/backend/core/models/prospect.py
+index a898100..19393bc 100644
+--- a/backend/core/models/prospect.py
++++ b/backend/core/models/prospect.py
+@@ -61,4 +61,14 @@ class CampaignProspectLink(TimestampedModel):
+     # - next_follow_up_at: ISO UTC timestamp of the currently scheduled follow-up,
+     #   if any (informational / for the dashboard).
+     follow_up_owed: bool = False
+-    next_follow_up_at: Optional[str] = None
+\ No newline at end of file
++    next_follow_up_at: Optional[str] = None
++
++    # Meeting-booking state (set by orchestrator.meeting_scheduler once Converse
++    # advances a prospect to MEETING — see agents/converse/policy.py's
++    # "meeting_request" outcome):
++    # - meeting_link: the Google Meet link emailed to the prospect.
++    # - meeting_scheduled_at: ISO UTC timestamp of the booked slot.
++    # - calendar_event_id: id of the event created on the admin's Google Calendar.
++    meeting_link: Optional[str] = None
++    meeting_scheduled_at: Optional[str] = None
++    calendar_event_id: Optional[str] = None
+\ No newline at end of file
+diff --git a/backend/integrations/__init__.py b/backend/integrations/__init__.py
+new file mode 100644
+index 0000000..78b28fa
+--- /dev/null
++++ b/backend/integrations/__init__.py
+@@ -0,0 +1,5 @@
++"""Outbound integrations with third-party services (Google Calendar, SMTP email).
++
++Kept separate from agents/ and orchestrator/: these are the "does it actually
++leave the building" side-effects for a booked meeting, not decision logic.
++"""
+diff --git a/backend/integrations/calendar.py b/backend/integrations/calendar.py
+new file mode 100644
+index 0000000..e1c5e64
+--- /dev/null
++++ b/backend/integrations/calendar.py
+@@ -0,0 +1,143 @@
++"""Google Calendar integration: creates the meeting event — with an
++auto-generated Google Meet link — on the admin's calendar.
++
++Auth: a Google service account with domain-wide delegation, so it can act
++*as* the admin (impersonate their calendar) rather than needing each admin to
++individually OAuth. See:
++https://developers.google.com/identity/protocols/oauth2/service-account
++
++Env vars:
++  GOOGLE_SERVICE_ACCOUNT_JSON  -> either the service-account JSON itself, or a
++                                   path to the JSON key file.
++
++Dev fallback: if GOOGLE_SERVICE_ACCOUNT_JSON isn't set, this doesn't raise —
++it logs what it *would* have created and returns a stub Meet link, so the
++Converse -> meeting pipeline runs end to end without live Google credentials
++(same "runs out of the box" pattern as auth/security.py's JWT_SECRET dev
++fallback and rag/embeddings.py's TF-IDF default backend). Set the env var
++above for a real calendar event + Meet link.
++"""
++from __future__ import annotations
++
++import json
++import logging
++import os
++import uuid
++from dataclasses import dataclass
++from datetime import datetime, timedelta
++from typing import Optional
++
++logger = logging.getLogger(__name__)
++
++SCOPES = ["https://www.googleapis.com/auth/calendar"]
++
++
++@dataclass
++class MeetingEvent:
++    event_id: str
++    meet_link: str
++    html_link: Optional[str]
++    start: datetime
++    end: datetime
++    is_stub: bool = False  # True when created via the no-credentials dev fallback
++
++
++def _extract_meet_link(event: dict) -> str:
++    for ep in event.get("conferenceData", {}).get("entryPoints", []):
++        if ep.get("entryPointType") == "video":
++            return ep.get("uri", "")
++    return event.get("hangoutLink", "")
++
++
++class GoogleCalendarClient:
++    """Thin wrapper around Calendar API's events.insert with conferenceData,
++    scoped to whichever admin calendar the service account is asked to act as."""
++
++    def __init__(self, *, service_account_json: Optional[str] = None) -> None:
++        self._service_account_json = service_account_json or os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
++
++    def is_configured(self) -> bool:
++        return bool(self._service_account_json)
++
++    def _build_service(self, subject: str):
++        # Imported lazily so the module (and the dev stub path) works even in
++        # environments that don't have google-api-python-client installed.
++        from google.oauth2 import service_account
++        from googleapiclient.discovery import build
++
++        raw = self._service_account_json.strip()
++        info = json.loads(raw) if raw.startswith("{") else json.loads(open(raw, encoding="utf-8").read())
++        creds = service_account.Credentials.from_service_account_info(info, scopes=SCOPES)
++        delegated = creds.with_subject(subject)  # domain-wide delegation: act as the admin
++        return build("calendar", "v3", credentials=delegated, cache_discovery=False)
++
++    def create_meeting_event(
++        self,
++        *,
++        admin_email: str,
++        participant_email: str,
++        participant_name: str,
++        summary: str,
++        description: str,
++        start: datetime,
++        duration_minutes: int = 30,
++        calendar_id: str = "primary",
++    ) -> MeetingEvent:
++        end = start + timedelta(minutes=duration_minutes)
++
++        if not self.is_configured():
++            stub_id = uuid.uuid4().hex[:10]
++            logger.warning(
++                "GOOGLE_SERVICE_ACCOUNT_JSON not set — creating a STUB calendar event for "
++                "%s on %s's calendar (no real Google Calendar API call made). "
++                "Set GOOGLE_SERVICE_ACCOUNT_JSON to create real events with a real Meet link.",
++                participant_email, admin_email,
++            )
++            return MeetingEvent(
++                event_id=f"stub_{stub_id}",
++                meet_link=f"https://meet.google.com/{stub_id[:3]}-{stub_id[3:7]}-{stub_id[7:10]}",
++                html_link=None,
++                start=start, end=end, is_stub=True,
++            )
++
++        service = self._build_service(admin_email)
++        body = {
++            "summary": summary,
++            "description": description,
++            "start": {"dateTime": start.isoformat(), "timeZone": "UTC"},
++            "end": {"dateTime": end.isoformat(), "timeZone": "UTC"},
++            "attendees": [
++                {"email": admin_email},
++                {"email": participant_email, "displayName": participant_name},
++            ],
++            "conferenceData": {
++                "createRequest": {
++                    "requestId": uuid.uuid4().hex,
++                    "conferenceSolutionKey": {"type": "hangoutsMeet"},
++                }
++            },
++            "reminders": {
++                "useDefault": False,
++                "overrides": [{"method": "email", "minutes": 60}, {"method": "popup", "minutes": 10}],
++            },
++        }
++        event = service.events().insert(
++            calendarId=calendar_id, body=body, conferenceDataVersion=1, sendUpdates="all",
++        ).execute()
++
++        return MeetingEvent(
++            event_id=event["id"],
++            meet_link=_extract_meet_link(event),
++            html_link=event.get("htmlLink"),
++            start=start, end=end, is_stub=False,
++        )
++
++
++_default_client: Optional[GoogleCalendarClient] = None
++
++
++def default_client() -> GoogleCalendarClient:
++    global _default_client
++    if _default_client is None:
++        _default_client = GoogleCalendarClient()
++    return _default_client
+diff --git a/backend/integrations/mailer.py b/backend/integrations/mailer.py
+new file mode 100644
+index 0000000..ddccec7
+--- /dev/null
++++ b/backend/integrations/mailer.py
+@@ -0,0 +1,111 @@
++"""Sends the participant-facing meeting email: the Google Meet link + a
++reminder of when the meeting is.
++
++Env vars:
++  SMTP_HOST, SMTP_PORT (default 587), SMTP_USER, SMTP_PASSWORD, SMTP_FROM
++  (defaults to SMTP_USER), SMTP_USE_TLS (default "true").
++
++  Works as-is against Gmail SMTP (smtp.gmail.com:587 + an app password) or
++  any standard SMTP relay.
++
++Dev fallback: if SMTP_HOST/SMTP_USER/SMTP_PASSWORD aren't all set, the email
++is logged instead of sent, so the pipeline runs end to end without live SMTP
++credentials — same pattern as integrations/calendar.py's stub mode.
++"""
++from __future__ import annotations
++
++import logging
++import os
++import smtplib
++from dataclasses import dataclass
++from datetime import datetime
++from email.message import EmailMessage
++from typing import Optional
++
++logger = logging.getLogger(__name__)
++
++
++@dataclass
++class EmailResult:
++    sent: bool
++    to: str
++    subject: str
++    is_stub: bool = False
++
++
++def _format_meeting_email(
++    *, to_name: str, meet_link: str, start: datetime, end: datetime,
++    admin_name: str, admin_email: str, campaign_name: str,
++) -> tuple[str, str]:
++    subject = f"Meeting confirmed: {campaign_name} — {start.strftime('%a %d %b, %H:%M UTC')}"
++    body = (
++        f"Hi {to_name or 'there'},\n\n"
++        f"Your meeting with {admin_name} ({admin_email}) is confirmed.\n\n"
++        f"When:  {start.strftime('%A, %d %B %Y, %H:%M')} - {end.strftime('%H:%M')} UTC\n"
++        f"Where: Google Meet — {meet_link}\n\n"
++        f"This is a reminder to join a few minutes early. Reply to this email if you "
++        f"need to reschedule.\n\n"
++        f"See you there,\n{admin_name}"
++    )
++    return subject, body
++
++
++class EmailSender:
++    def __init__(
++        self, *,
++        host: Optional[str] = None, port: Optional[int] = None,
++        username: Optional[str] = None, password: Optional[str] = None,
++        sender: Optional[str] = None, use_tls: Optional[bool] = None,
++    ) -> None:
++        self._host = host or os.getenv("SMTP_HOST")
++        self._port = port or int(os.getenv("SMTP_PORT", "587"))
++        self._username = username or os.getenv("SMTP_USER")
++        self._password = password or os.getenv("SMTP_PASSWORD")
++        self._sender = sender or os.getenv("SMTP_FROM") or self._username or "sdr@sdrhq.io"
++        self._use_tls = use_tls if use_tls is not None else os.getenv("SMTP_USE_TLS", "true").lower() != "false"
++
++    def is_configured(self) -> bool:
++        return bool(self._host and self._username and self._password)
++
++    def send_meeting_invite(
++        self, *,
++        to_email: str, to_name: str, meet_link: str,
++        start: datetime, end: datetime,
++        admin_name: str, admin_email: str, campaign_name: str,
++    ) -> EmailResult:
++        subject, body = _format_meeting_email(
++            to_name=to_name, meet_link=meet_link, start=start, end=end,
++            admin_name=admin_name, admin_email=admin_email, campaign_name=campaign_name,
++        )
++
++        if not self.is_configured():
++            logger.warning(
++                "SMTP not fully configured (SMTP_HOST/SMTP_USER/SMTP_PASSWORD) — logging the "
++                "meeting-invite email to %s instead of sending it.\nSubject: %s\n%s",
++                to_email, subject, body,
++            )
++            return EmailResult(sent=False, to=to_email, subject=subject, is_stub=True)
++
++        msg = EmailMessage()
++        msg["Subject"] = subject
++        msg["From"] = self._sender
++        msg["To"] = to_email
++        msg.set_content(body)
++
++        with smtplib.SMTP(self._host, self._port, timeout=15) as smtp:
++            if self._use_tls:
++                smtp.starttls()
++            smtp.login(self._username, self._password)
++            smtp.send_message(msg)
++
++        return EmailResult(sent=True, to=to_email, subject=subject, is_stub=False)
++
++
++_default_sender: Optional[EmailSender] = None
++
++
++def default_sender() -> EmailSender:
++    global _default_sender
++    if _default_sender is None:
++        _default_sender = EmailSender()
++    return _default_sender
+diff --git a/backend/orchestrator/meeting_scheduler.py b/backend/orchestrator/meeting_scheduler.py
+new file mode 100644
+index 0000000..cb2bf21
+--- /dev/null
++++ b/backend/orchestrator/meeting_scheduler.py
+@@ -0,0 +1,137 @@
++"""Books the meeting once Converse decides a prospect wants one.
++
++Called from orchestrator.service.process_converse when Converse's next_action
++is "advance_meeting" (see agents/converse/policy.py's "meeting_request"
++outcome). Creates a Google Calendar event — with an auto-generated Google
++Meet link — on the admin's calendar, emails the participant that link plus a
++reminder, and records both on the CampaignProspectLink (so the Prospects view
++can show it) and as an outbound ConversationTurn (so it shows up in the
++conversation history / decision trace like any other touch).
++
++"Agents decide, orchestrator executes": Converse only decided the prospect
++wants to meet — this module is the "executes" part for that outcome, the same
++role orchestrator/service.py already plays for replies and follow-ups.
++"""
++from __future__ import annotations
++
++import os
++from datetime import datetime, timedelta, timezone
++from typing import Optional
++
++from sqlalchemy.ext.asyncio import AsyncSession
++
++from core.db import repository as repo
++from core.models import Campaign, CampaignProspectLink, Channel, ConversationTurn, Direction, Prospect, UserRole
++from integrations.calendar import default_client as default_calendar_client
++from integrations.mailer import default_sender as default_email_sender
++
++# How far out (in business days) and at what hour UTC the default slot lands.
++# A human can always move it in Google Calendar afterwards — the goal here is
++# getting an invite out immediately rather than blocking on someone picking a time.
++DEFAULT_LEAD_DAYS = int(os.getenv("MEETING_DEFAULT_LEAD_DAYS", "1"))
++DEFAULT_HOUR_UTC = int(os.getenv("MEETING_DEFAULT_HOUR_UTC", "15"))
++DEFAULT_DURATION_MINUTES = int(os.getenv("MEETING_DURATION_MINUTES", "30"))
++
++
++def _next_slot(now: Optional[datetime] = None) -> datetime:
++    now = now or datetime.now(timezone.utc)
++    candidate = now
++    days_added = 0
++    while days_added < DEFAULT_LEAD_DAYS:
++        candidate += timedelta(days=1)
++        if candidate.weekday() < 5:  # Mon-Fri only
++            days_added += 1
++    return candidate.replace(hour=DEFAULT_HOUR_UTC, minute=0, second=0, microsecond=0)
++
++
++async def _resolve_admin(session: AsyncSession, campaign: Campaign) -> dict:
++    """Whose calendar the event goes on. Priority:
++    ADMIN_CALENDAR_EMAIL env override -> an ADMIN-role user -> the campaign owner."""
++    override = os.getenv("ADMIN_CALENDAR_EMAIL")
++    if override:
++        return {"email": override, "name": os.getenv("ADMIN_CALENDAR_NAME", "Admin")}
++
++    users = await repo.list_users(session)
++    admin = next((u for u in users if u.role == UserRole.ADMIN and u.is_active), None)
++    if admin:
++        return {"email": admin.email, "name": admin.full_name or "Admin"}
++
++    return {"email": campaign.owner, "name": "Admin"}
++
++
++async def schedule_meeting(
++    session: AsyncSession,
++    campaign: Campaign,
++    link: CampaignProspectLink,
++    prospect: Prospect,
++) -> dict:
++    """Create the calendar event + send the participant email. Mutates `link`
++    in place with the booking details (caller is responsible for persisting
++    it, same as every other orchestrator.service mutation)."""
++    participant_email = prospect.profile.work_email
++    admin = await _resolve_admin(session, campaign)
++
++    if not participant_email:
++        return {
++            "status": "skipped",
++            "reason": "prospect has no work_email on file — nothing to send the invite to",
++            "admin_email": admin["email"],
++        }
++
++    start = _next_slot()
++    summary = f"{campaign.name} — intro call with {prospect.profile.name}"
++    description = (
++        f"Booked automatically by the Converse agent after {prospect.profile.name} "
++        f"asked to meet in campaign \"{campaign.name}\"."
++    )
++
++    calendar_event = default_calendar_client().create_meeting_event(
++        admin_email=admin["email"],
++        participant_email=participant_email,
++        participant_name=prospect.profile.name,
++        summary=summary,
++        description=description,
++        start=start,
++        duration_minutes=DEFAULT_DURATION_MINUTES,
++    )
++
++    email_result = default_email_sender().send_meeting_invite(
++        to_email=participant_email,
++        to_name=prospect.profile.name,
++        meet_link=calendar_event.meet_link,
++        start=calendar_event.start,
++        end=calendar_event.end,
++        admin_name=admin["name"],
++        admin_email=admin["email"],
++        campaign_name=campaign.name,
++    )
++
++    link.meeting_link = calendar_event.meet_link
++    link.meeting_scheduled_at = calendar_event.start.isoformat()
++    link.calendar_event_id = calendar_event.event_id
++
++    await repo.append_turn(session, ConversationTurn(
++        campaign_id=campaign.id,
++        prospect_id=prospect.id,
++        channel=Channel.EMAIL,
++        direction=Direction.OUTBOUND,
++        agent_name="converse",
++        content=(
++            f"Meeting invite sent to {participant_email} — Google Meet link {calendar_event.meet_link}, "
++            f"{calendar_event.start.strftime('%Y-%m-%d %H:%M UTC')} "
++            f"(calendar event added on {admin['email']}'s calendar)."
++        ),
++    ))
++
++    return {
++        "status": "booked",
++        "meet_link": calendar_event.meet_link,
++        "scheduled_at": calendar_event.start.isoformat(),
++        "duration_minutes": DEFAULT_DURATION_MINUTES,
++        "calendar_event_id": calendar_event.event_id,
++        "calendar_is_stub": calendar_event.is_stub,
++        "email_sent": email_result.sent,
++        "email_is_stub": email_result.is_stub,
++        "admin_email": admin["email"],
++        "participant_email": participant_email,
++    }
+diff --git a/backend/orchestrator/service.py b/backend/orchestrator/service.py
+index f2a285e..a2e363a 100644
+--- a/backend/orchestrator/service.py
++++ b/backend/orchestrator/service.py
+@@ -27,6 +27,7 @@ from core.models import (
+     Prospect,
+ )
+ from orchestrator import state_machine as sm
++from orchestrator.meeting_scheduler import schedule_meeting
+ 
+ converse_agent = ConverseAgent()
+ 
+@@ -82,7 +83,15 @@ async def process_converse(
+         await repo.append_decision(session, p_decision)
+         follow_up_draft = p_decision
+ 
+-    return {"decision": decision, "personalize_followup": follow_up_draft}
++    meeting: Optional[dict] = None
++    if next_action == "advance_meeting":
++        # Converse decided the prospect wants to meet — actually book it: a
++        # Google Calendar event (+ Meet link) on the admin's calendar, and an
++        # email to the participant with that link and a reminder.
++        meeting = await schedule_meeting(session, campaign, link, prospect)
++        await repo.save_link(session, link)
++
++    return {"decision": decision, "personalize_followup": follow_up_draft, "meeting": meeting}
+ 
+ 
+ async def fire_follow_up(session: AsyncSession, campaign_id: str, link_id: str) -> dict:
+diff --git a/backend/pytest.ini b/backend/pytest.ini
+new file mode 100644
+index 0000000..a635c5c
+--- /dev/null
++++ b/backend/pytest.ini
+@@ -0,0 +1,2 @@
++[pytest]
++pythonpath = .
+diff --git a/backend/tests/test_meeting_scheduler.py b/backend/tests/test_meeting_scheduler.py
+new file mode 100644
+index 0000000..590cb43
+--- /dev/null
++++ b/backend/tests/test_meeting_scheduler.py
+@@ -0,0 +1,81 @@
++"""Unit tests for the meeting-booking pipeline (integrations + the pure
++scheduling helper). No DB, no network, no real Google/SMTP credentials —
++these exercise the dev-fallback ("stub") paths that let the app run out of
++the box, same as the rest of this codebase's tests would for e.g. the TF-IDF
++fallback embedding backend.
++"""
++from __future__ import annotations
++
++import os
++from datetime import datetime, timedelta, timezone
++
++import pytest
++
++from integrations.calendar import GoogleCalendarClient
++from integrations.mailer import EmailSender
++from orchestrator.meeting_scheduler import DEFAULT_LEAD_DAYS, _next_slot
++
++
++# --- GoogleCalendarClient: dev fallback (no credentials configured) --------
++def test_calendar_client_without_credentials_returns_stub_meet_link():
++    client = GoogleCalendarClient(service_account_json=None)
++    assert client.is_configured() is False
++
++    start = datetime(2026, 9, 22, 15, 0, tzinfo=timezone.utc)
++    event = client.create_meeting_event(
++        admin_email="admin@sdrhq.io",
++        participant_email="prospect@example.com",
++        participant_name="Jamie Prospect",
++        summary="Intro call",
++        description="test",
++        start=start,
++        duration_minutes=30,
++    )
++
++    assert event.is_stub is True
++    assert event.meet_link.startswith("https://meet.google.com/")
++    assert event.start == start
++    assert event.end == start + timedelta(minutes=30)
++    assert event.event_id.startswith("stub_")
++
++
++def test_calendar_client_is_configured_when_credentials_present():
++    client = GoogleCalendarClient(service_account_json='{"type": "service_account"}')
++    assert client.is_configured() is True
++
++
++# --- EmailSender: dev fallback (no SMTP configured) ------------------------
++def test_email_sender_without_smtp_logs_instead_of_sending():
++    sender = EmailSender(host=None, username=None, password=None)
++    assert sender.is_configured() is False
++
++    start = datetime(2026, 9, 22, 15, 0, tzinfo=timezone.utc)
++    end = start + timedelta(minutes=30)
++    result = sender.send_meeting_invite(
++        to_email="prospect@example.com", to_name="Jamie Prospect",
++        meet_link="https://meet.google.com/abc-defg-hij",
++        start=start, end=end,
++        admin_name="Ava Chen", admin_email="ava@sdrhq.io", campaign_name="Q4 Outbound",
++    )
++
++    assert result.sent is False
++    assert result.is_stub is True
++    assert result.to == "prospect@example.com"
++    assert "Q4 Outbound" in result.subject
++
++
++def test_email_sender_is_configured_when_smtp_env_present():
++    sender = EmailSender(host="smtp.gmail.com", username="me@sdrhq.io", password="app-password")
++    assert sender.is_configured() is True
++
++
++# --- _next_slot: deterministic default meeting time -------------------------
++def test_next_slot_lands_on_a_weekday_at_the_configured_hour():
++    # A Friday -> with 1 business day lead, should land on Monday (skips the weekend).
++    friday = datetime(2026, 9, 25, 10, 0, tzinfo=timezone.utc)  # 2026-09-25 is a Friday
++    slot = _next_slot(now=friday)
++
++    assert slot.weekday() < 5  # Mon-Fri
++    assert slot > friday
++    if DEFAULT_LEAD_DAYS == 1:
++        assert slot.date() == datetime(2026, 9, 28, tzinfo=timezone.utc).date()  # the following Monday
+diff --git a/requirements.txt b/requirements.txt
+index d606ee4..f3ca323 100644
+--- a/requirements.txt
++++ b/requirements.txt
+@@ -33,6 +33,14 @@ pyjwt>=2.8
+ bcrypt>=4.1
+ email-validator>=2.1   # required by pydantic EmailStr
+ 
++# Meeting booking: Google Calendar event (+ Meet link) on the admin's calendar,
++# once Converse decides a prospect wants to meet (orchestrator/meeting_scheduler.py).
++# Imported lazily — only needed when GOOGLE_SERVICE_ACCOUNT_JSON is actually set;
++# without it, meeting_scheduler falls back to a stub Meet link so the app still
++# runs out of the box. Email delivery itself uses stdlib smtplib (see .env.example).
++google-api-python-client>=2.100
++google-auth>=2.23
++
+ # Testing
+ pytest>=8.0
+ pytest-cov>=5.0
+\ No newline at end of file
+-- 
+2.43.0
+
