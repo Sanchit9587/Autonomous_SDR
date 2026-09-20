@@ -1,18 +1,12 @@
-"""FastAPI application entrypoint.
-
-Run locally (from backend/):
-    uvicorn api.main:app --reload
-
-Tables are managed by Alembic (`alembic upgrade head`), not created here — so a
-fresh clone runs migrations once, and the app never silently diverges from the
-migration history. The startup hook only verifies connectivity.
-"""
+"""FastAPI application entrypoint."""
 from __future__ import annotations
 
+import os
 from contextlib import asynccontextmanager
 
 from dotenv import load_dotenv
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import text
 
 from core.db.engine import get_engine
@@ -22,10 +16,11 @@ from orchestrator.scheduler import shutdown_scheduler, start_scheduler
 
 load_dotenv()
 
+IS_VERCEL = os.getenv("VERCEL") == "1"
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Fail fast on startup if the DB is unreachable, with a clear message.
     engine = get_engine()
     try:
         async with engine.connect() as conn:
@@ -35,14 +30,36 @@ async def lifespan(app: FastAPI):
             f"Could not connect to the database on startup: {exc}. "
             "Check DATABASE_URL in .env and that migrations have been run (alembic upgrade head)."
         ) from exc
-    start_scheduler()      # follow-up timers (persistent job store on Postgres)
+
+    if not IS_VERCEL:
+        start_scheduler()
+
     try:
         yield
     finally:
-        shutdown_scheduler()
+        if not IS_VERCEL:
+            shutdown_scheduler()
 
 
-app = FastAPI(title="Autonomous SDR Platform", lifespan=lifespan)
+app = FastAPI(
+    title="Autonomous SDR Platform",
+    lifespan=lifespan,
+    redirect_slashes=False,  # Prevents 307 redirects on preflight OPTIONS requests
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "https://autonomous-sdr-94rm.vercel.app",  # Your primary frontend deployment
+        "http://localhost:5173",
+        "http://localhost:3000",
+    ],
+    allow_origin_regex=r"https://.*\.vercel\.app",  # Handles dynamic Vercel preview URLs
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 app.include_router(auth_router)
 app.include_router(campaigns_router)
 
