@@ -1,21 +1,30 @@
-"""FastAPI router for campaign + prospect control.
+"""FastAPI router for campaign + prospect control, backed by the database.
 
-In-memory store for now (dicts). This is intentional: it lets the whole
-orchestrator be built and demoed today, and gets swapped for real persistence
-(core/db/, alembic) later without changing a single function signature here —
-the store is the only thing that will change.
+Every endpoint takes an async DB session and reads/writes via core.db.repository
+(agents decide, orchestrator executes — and now persists). The only remaining
+in-memory piece is the global kill switch: it's a platform-wide emergency stop
+whose "off on restart" behaviour is acceptable (a restart is itself a reset),
+and it isn't one of the persisted domain objects.
+
+Agents are synchronous and fast (rule/RAG/one optional LLM call), so they're
+called directly inside the async endpoints. If an agent's LLM call ever becomes
+slow enough to block the event loop under load, wrap agent.run() in
+fastapi.concurrency.run_in_threadpool — the call sites are all marked below.
 """
 from __future__ import annotations
 
 from typing import Optional
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from agents.base import AgentContext
-from agents.converse.agent import ConverseAgent
 from agents.personalize.agent import PersonalizeAgent
 from agents.research.agent import ResearchAgent
+from auth.dependencies import require_manager
+from core.db import repository as repo
+from core.db.engine import get_session
 from core.models import (
     AgentDecision,
     AgentSettings,
@@ -23,6 +32,7 @@ from core.models import (
     CampaignAsset,
     CampaignProspectLink,
     Channel,
+    ChannelPolicy,
     ConversationTurn,
     DecisionVerdict,
     Direction,
@@ -32,24 +42,21 @@ from core.models import (
     Prospect,
 )
 from orchestrator import campaign_controller as cc
+from orchestrator import scheduler as sched
+from orchestrator import service
 from orchestrator import state_machine as sm
 from orchestrator.conflict_resolver import detect_cross_campaign_conflicts, find_duplicate_prospects
-from orchestrator.suppression import SuppressionList
 
-router = APIRouter(prefix="/campaigns", tags=["campaigns"])
+# The entire /campaigns API is the Manager control plane, so the whole router
+# requires an authenticated Manager (Admin passes too). Rep-facing read views
+# will live in a separate rep router with rep-scoped queries.
+router = APIRouter(prefix="/campaigns", tags=["campaigns"], dependencies=[Depends(require_manager)])
 
-# --- in-memory store -------------------------------------------------------
-_campaigns: dict[str, Campaign] = {}
-_prospects: dict[str, Prospect] = {}
-_links: dict[str, CampaignProspectLink] = {}  # keyed by link.id
-_personas: dict[str, Persona] = {}
-_assets: dict[str, CampaignAsset] = {}
-_decisions: list[AgentDecision] = []
-_conversations: list[ConversationTurn] = []
-suppression = SuppressionList()
+# Stateless agent instances (no per-request state; safe to share).
+research_agent = ResearchAgent()
+
+# Global kill switch — deliberately in-memory (see module docstring).
 kill_switch = cc.GlobalKillSwitch()
-research_agent = ResearchAgent()  # zero-config default: no Apollo, template/Gemini/Groq reasoning per env
-converse_agent = ConverseAgent()
 
 
 # --- request/response payloads ---------------------------------------------
@@ -57,9 +64,35 @@ class CreateCampaignRequest(BaseModel):
     name: str
     owner: str
     description: Optional[str] = None
+    vision_statement: Optional[str] = None
     icp: ICPFilter = ICPFilter()
     agent_settings: dict[str, AgentSettings] = {}
     default_channel_priority: list = []
+    channel_policies: list[ChannelPolicy] = []
+    budget: Optional[float] = None
+    start_date: Optional[str] = None
+    end_date: Optional[str] = None
+    target_scale: Optional[int] = None
+    pace_per_day: Optional[int] = None
+    goals: list[str] = []
+
+
+class UpdateCampaignRequest(BaseModel):
+    """All optional — only provided fields are updated (PATCH semantics)."""
+    name: Optional[str] = None
+    description: Optional[str] = None
+    vision_statement: Optional[str] = None
+    icp: Optional[ICPFilter] = None
+    agent_settings: Optional[dict[str, AgentSettings]] = None
+    default_channel_priority: Optional[list] = None
+    channel_policies: Optional[list[ChannelPolicy]] = None
+    budget: Optional[float] = None
+    start_date: Optional[str] = None
+    end_date: Optional[str] = None
+    target_scale: Optional[int] = None
+    pace_per_day: Optional[int] = None
+    goals: Optional[list[str]] = None
+    assigned_rep_ids: Optional[list[str]] = None
 
 
 class TransitionRequest(BaseModel):
@@ -67,116 +100,143 @@ class TransitionRequest(BaseModel):
     reason: Optional[str] = None
 
 
-def _get_campaign(campaign_id: str) -> Campaign:
-    campaign = _campaigns.get(campaign_id)
+class ConverseRequest(BaseModel):
+    inbound_message: Optional[str] = None
+    trigger: str = "reply"                 # "reply" | "follow_up"
+    channel: Channel = Channel.EMAIL
+
+
+# --- helpers ----------------------------------------------------------------
+async def _require_campaign(session: AsyncSession, campaign_id: str) -> Campaign:
+    campaign = await repo.get_campaign(session, campaign_id)
     if campaign is None:
         raise HTTPException(404, f"Campaign {campaign_id} not found")
     return campaign
 
 
-def _get_link(link_id: str) -> CampaignProspectLink:
-    link = _links.get(link_id)
+async def _require_link(session: AsyncSession, link_id: str) -> CampaignProspectLink:
+    link = await repo.get_link(session, link_id)
     if link is None:
         raise HTTPException(404, f"CampaignProspectLink {link_id} not found")
     return link
 
 
+async def _require_prospect(session: AsyncSession, prospect_id: str) -> Prospect:
+    prospect = await repo.get_prospect(session, prospect_id)
+    if prospect is None:
+        raise HTTPException(404, f"Prospect {prospect_id} not found")
+    return prospect
+
+
 # --- campaign lifecycle ------------------------------------------------------
 @router.post("", response_model=Campaign)
-def create_campaign(body: CreateCampaignRequest) -> Campaign:
-    campaign = Campaign(
-        name=body.name, owner=body.owner, description=body.description, icp=body.icp,
-        agent_settings=body.agent_settings, default_channel_priority=body.default_channel_priority,
-    )
-    _campaigns[campaign.id] = campaign
-    return campaign
+async def create_campaign(body: CreateCampaignRequest, session: AsyncSession = Depends(get_session)) -> Campaign:
+    campaign = Campaign(**body.model_dump())
+    return await repo.save_campaign(session, campaign)
 
 
 @router.get("", response_model=list[Campaign])
-def list_campaigns() -> list[Campaign]:
-    return list(_campaigns.values())
+async def list_campaigns(session: AsyncSession = Depends(get_session)) -> list[Campaign]:
+    return await repo.list_campaigns(session)
 
 
 @router.get("/{campaign_id}", response_model=Campaign)
-def get_campaign(campaign_id: str) -> Campaign:
-    return _get_campaign(campaign_id)
+async def get_campaign(campaign_id: str, session: AsyncSession = Depends(get_session)) -> Campaign:
+    return await _require_campaign(session, campaign_id)
 
 
-def _lifecycle_endpoint(campaign_id: str, action):
-    campaign = _get_campaign(campaign_id)
+@router.patch("/{campaign_id}", response_model=Campaign)
+async def update_campaign(campaign_id: str, body: UpdateCampaignRequest, session: AsyncSession = Depends(get_session)) -> Campaign:
+    """Edit campaign config (Campaign Config / Modify screens). Only provided
+    fields change; the rest are left as-is."""
+    campaign = await _require_campaign(session, campaign_id)
+    updates = body.model_dump(exclude_unset=True)
+    for field, value in updates.items():
+        setattr(campaign, field, value)
+    return await repo.save_campaign(session, campaign)
+
+
+async def _lifecycle_endpoint(session: AsyncSession, campaign_id: str, action) -> Campaign:
+    campaign = await _require_campaign(session, campaign_id)
     try:
         action(campaign)
     except cc.InvalidCampaignStatusTransitionError as exc:
         raise HTTPException(409, str(exc)) from exc
-    return campaign
+    return await repo.save_campaign(session, campaign)
 
 
 @router.post("/{campaign_id}/activate", response_model=Campaign)
-def activate_campaign(campaign_id: str) -> Campaign:
-    return _lifecycle_endpoint(campaign_id, cc.activate)
+async def activate_campaign(campaign_id: str, session: AsyncSession = Depends(get_session)) -> Campaign:
+    return await _lifecycle_endpoint(session, campaign_id, cc.activate)
 
 
 @router.post("/{campaign_id}/pause", response_model=Campaign)
-def pause_campaign(campaign_id: str) -> Campaign:
-    """Pausing one campaign never touches any other — verified in tests."""
-    return _lifecycle_endpoint(campaign_id, cc.pause)
+async def pause_campaign(campaign_id: str, session: AsyncSession = Depends(get_session)) -> Campaign:
+    """Pausing one campaign never touches any other."""
+    return await _lifecycle_endpoint(session, campaign_id, cc.pause)
 
 
 @router.post("/{campaign_id}/resume", response_model=Campaign)
-def resume_campaign(campaign_id: str) -> Campaign:
-    return _lifecycle_endpoint(campaign_id, cc.resume)
+async def resume_campaign(campaign_id: str, session: AsyncSession = Depends(get_session)) -> Campaign:
+    campaign = await _lifecycle_endpoint(session, campaign_id, cc.resume)
+    # Fire any follow-ups that came due while the campaign was paused.
+    await sched.fire_owed_follow_ups(session, campaign)
+    return campaign
 
 
 @router.post("/{campaign_id}/complete", response_model=Campaign)
-def complete_campaign(campaign_id: str) -> Campaign:
-    return _lifecycle_endpoint(campaign_id, cc.complete)
+async def complete_campaign(campaign_id: str, session: AsyncSession = Depends(get_session)) -> Campaign:
+    campaign = await _lifecycle_endpoint(session, campaign_id, cc.complete)
+    sched.cancel_follow_ups_for_campaign(campaign_id)  # terminal: clean up timers
+    return campaign
 
 
 @router.post("/{campaign_id}/archive", response_model=Campaign)
-def archive_campaign(campaign_id: str) -> Campaign:
-    return _lifecycle_endpoint(campaign_id, cc.archive)
+async def archive_campaign(campaign_id: str, session: AsyncSession = Depends(get_session)) -> Campaign:
+    campaign = await _lifecycle_endpoint(session, campaign_id, cc.archive)
+    sched.cancel_follow_ups_for_campaign(campaign_id)  # terminal: clean up timers
+    return campaign
 
 
 @router.post("/{campaign_id}/duplicate", response_model=Campaign)
-def duplicate_campaign(campaign_id: str) -> Campaign:
-    clone = cc.duplicate(_get_campaign(campaign_id))
-    _campaigns[clone.id] = clone
-    return clone
+async def duplicate_campaign(campaign_id: str, session: AsyncSession = Depends(get_session)) -> Campaign:
+    original = await _require_campaign(session, campaign_id)
+    clone = cc.duplicate(original)
+    return await repo.save_campaign(session, clone)
 
 
 @router.post("/kill-switch/engage")
-def engage_kill_switch() -> dict[str, bool]:
+async def engage_kill_switch() -> dict[str, bool]:
     kill_switch.engage()
     return {"engaged": True}
 
 
 @router.post("/kill-switch/disengage")
-def disengage_kill_switch() -> dict[str, bool]:
+async def disengage_kill_switch() -> dict[str, bool]:
     kill_switch.disengage()
     return {"engaged": False}
 
 
 # --- prospects + funnel transitions -----------------------------------------
 @router.post("/{campaign_id}/prospects", response_model=CampaignProspectLink)
-def add_prospect(campaign_id: str, prospect: Prospect) -> CampaignProspectLink:
-    _get_campaign(campaign_id)  # 404 if missing
-    _prospects[prospect.id] = prospect
+async def add_prospect(campaign_id: str, prospect: Prospect, session: AsyncSession = Depends(get_session)) -> CampaignProspectLink:
+    await _require_campaign(session, campaign_id)
+    await repo.save_prospect(session, prospect)
     link = CampaignProspectLink(campaign_id=campaign_id, prospect_id=prospect.id)
-    _links[link.id] = link
-    return link
+    return await repo.save_link(session, link)
 
 
 @router.get("/{campaign_id}/funnel")
-def get_funnel(campaign_id: str) -> dict[str, int]:
-    _get_campaign(campaign_id)
-    campaign_links = [l for l in _links.values() if l.campaign_id == campaign_id]
-    return sm.funnel_counts(campaign_links)
+async def get_funnel(campaign_id: str, session: AsyncSession = Depends(get_session)) -> dict[str, int]:
+    await _require_campaign(session, campaign_id)
+    links = await repo.list_links_for_campaign(session, campaign_id)
+    return sm.funnel_counts(links)
 
 
 @router.post("/{campaign_id}/prospects/{link_id}/transition", response_model=CampaignProspectLink)
-def transition_prospect(campaign_id: str, link_id: str, body: TransitionRequest) -> CampaignProspectLink:
-    campaign = _get_campaign(campaign_id)
-    link = _get_link(link_id)
+async def transition_prospect(campaign_id: str, link_id: str, body: TransitionRequest, session: AsyncSession = Depends(get_session)) -> CampaignProspectLink:
+    campaign = await _require_campaign(session, campaign_id)
+    link = await _require_link(session, link_id)
 
     if kill_switch.is_engaged and body.to_stage in sm._OUTREACH_STAGES:
         raise HTTPException(423, "Global kill switch is engaged — no autonomous outreach permitted")
@@ -187,18 +247,18 @@ def transition_prospect(campaign_id: str, link_id: str, body: TransitionRequest)
         raise HTTPException(400, str(exc)) from exc
     except sm.CampaignNotLiveError as exc:
         raise HTTPException(409, str(exc)) from exc
-    return link
+    return await repo.save_link(session, link)
 
 
 @router.get("/conflicts/duplicates")
-def get_duplicate_prospects() -> list[dict]:
-    dupes = find_duplicate_prospects(list(_prospects.values()))
+async def get_duplicate_prospects(session: AsyncSession = Depends(get_session)) -> list[dict]:
+    dupes = find_duplicate_prospects(await repo.list_prospects(session))
     return [{"dedupe_key": d.dedupe_key, "prospect_ids": d.prospect_ids} for d in dupes]
 
 
 @router.get("/conflicts/cross-campaign")
-def get_cross_campaign_conflicts() -> list[dict]:
-    conflicts = detect_cross_campaign_conflicts(list(_links.values()))
+async def get_cross_campaign_conflicts(session: AsyncSession = Depends(get_session)) -> list[dict]:
+    conflicts = detect_cross_campaign_conflicts(await repo.list_all_links(session))
     return [
         {"prospect_id": c.prospect_id, "campaign_ids": c.campaign_ids, "reason": c.reason}
         for c in conflicts
@@ -207,38 +267,50 @@ def get_cross_campaign_conflicts() -> list[dict]:
 
 # --- personas ----------------------------------------------------------------
 @router.post("/{campaign_id}/personas", response_model=Persona)
-def create_persona(campaign_id: str, persona: Persona) -> Persona:
-    _get_campaign(campaign_id)
+async def create_persona(campaign_id: str, persona: Persona, session: AsyncSession = Depends(get_session)) -> Persona:
+    await _require_campaign(session, campaign_id)
     persona.campaign_id = campaign_id
-    _personas[persona.id] = persona
-    return persona
+    return await repo.save_persona(session, persona)
 
 
 @router.get("/{campaign_id}/personas", response_model=list[Persona])
-def list_personas(campaign_id: str) -> list[Persona]:
-    _get_campaign(campaign_id)
-    return [p for p in _personas.values() if p.campaign_id == campaign_id]
+async def list_personas(campaign_id: str, session: AsyncSession = Depends(get_session)) -> list[Persona]:
+    await _require_campaign(session, campaign_id)
+    return await repo.list_personas_for_campaign(session, campaign_id)
+
+
+# --- campaign assets ---------------------------------------------------------
+@router.post("/{campaign_id}/assets", response_model=CampaignAsset)
+async def create_asset(campaign_id: str, asset: CampaignAsset, session: AsyncSession = Depends(get_session)) -> CampaignAsset:
+    await _require_campaign(session, campaign_id)
+    asset.campaign_id = campaign_id
+    return await repo.save_asset(session, asset)
+
+
+@router.get("/{campaign_id}/assets", response_model=list[CampaignAsset])
+async def list_assets(campaign_id: str, session: AsyncSession = Depends(get_session)) -> list[CampaignAsset]:
+    await _require_campaign(session, campaign_id)
+    return await repo.list_assets_for_campaign(session, campaign_id)
 
 
 # --- research agent invocation ------------------------------------------------
 @router.post("/{campaign_id}/prospects/{link_id}/research")
-def run_research(campaign_id: str, link_id: str) -> dict:
-    """Runs the Research agent on one prospect and applies its decision via
-    the state machine. This is the orchestrator's job, not the agent's — the
-    agent only returns an AgentDecision, this endpoint is what actually calls
-    sm.transition() based on the verdict (agents decide, orchestrator executes)."""
-    campaign = _get_campaign(campaign_id)
-    link = _get_link(link_id)
-    prospect = _prospects.get(link.prospect_id)
-    if prospect is None:
-        raise HTTPException(404, f"Prospect {link.prospect_id} not found")
+async def run_research(campaign_id: str, link_id: str, session: AsyncSession = Depends(get_session)) -> dict:
+    """Runs Research on one prospect and applies its decision via the state
+    machine. Agent only returns an AgentDecision; this endpoint transitions
+    stage and persists (agents decide, orchestrator executes)."""
+    campaign = await _require_campaign(session, campaign_id)
+    link = await _require_link(session, link_id)
+    prospect = await _require_prospect(session, link.prospect_id)
+    personas = await repo.list_personas_for_campaign(session, campaign_id)
 
-    campaign_personas = [p for p in _personas.values() if p.campaign_id == campaign_id]
-    context = AgentContext(campaign=campaign, prospect=prospect, link=link, personas=campaign_personas)
-    decision = research_agent.run(context)
-    _decisions.append(decision)
+    context = AgentContext(campaign=campaign, prospect=prospect, link=link, personas=personas)
+    decision = research_agent.run(context)  # wrap in run_in_threadpool if this ever blocks
+    await repo.append_decision(session, decision)
 
-    # Advance Discovered -> Researched first, if not already past it.
+    # Enrichment may have mutated prospect.profile in place — persist it.
+    await repo.save_prospect(session, prospect)
+
     if link.stage == FunnelStage.DISCOVERED:
         sm.transition(link, FunnelStage.RESEARCHED, campaign)
 
@@ -251,131 +323,87 @@ def run_research(campaign_id: str, link_id: str) -> dict:
         sm.transition(link, FunnelStage.QUALIFIED, campaign)
     elif decision.verdict == DecisionVerdict.REJECT:
         sm.transition(link, FunnelStage.REJECTED, campaign)
-    # NEEDS_REVIEW: stays at RESEARCHED, awaiting the human-approval gate.
+    # NEEDS_REVIEW: stays at RESEARCHED.
 
+    await repo.save_link(session, link)
     return {"link": link, "decision": decision}
 
 
 @router.get("/{campaign_id}/prospects/{link_id}/decisions", response_model=list[AgentDecision])
-def get_decisions(campaign_id: str, link_id: str) -> list[AgentDecision]:
-    link = _get_link(link_id)
-    return [d for d in _decisions if d.campaign_id == campaign_id and d.prospect_id == link.prospect_id]
-
-
-# --- campaign assets ---------------------------------------------------------
-@router.post("/{campaign_id}/assets", response_model=CampaignAsset)
-def create_asset(campaign_id: str, asset: CampaignAsset) -> CampaignAsset:
-    _get_campaign(campaign_id)
-    asset.campaign_id = campaign_id
-    _assets[asset.id] = asset
-    return asset
-
-
-@router.get("/{campaign_id}/assets", response_model=list[CampaignAsset])
-def list_assets(campaign_id: str) -> list[CampaignAsset]:
-    _get_campaign(campaign_id)
-    return [a for a in _assets.values() if a.campaign_id == campaign_id]
+async def get_decisions(campaign_id: str, link_id: str, session: AsyncSession = Depends(get_session)) -> list[AgentDecision]:
+    link = await _require_link(session, link_id)
+    return await repo.list_decisions_for_prospect(session, campaign_id, link.prospect_id)
 
 
 # --- personalize agent invocation --------------------------------------------
 @router.post("/{campaign_id}/prospects/{link_id}/personalize")
-def run_personalize(campaign_id: str, link_id: str) -> dict:
-    """Runs the Personalize agent on a qualified prospect. Returns a draft +
-    channel + timing decision. Does NOT send — a SEND verdict is what the
-    orchestrator would hand to a messaging connector, and a WAIT verdict's
-    scheduled_time is what an APScheduler job would later fire on. Neither the
-    connector nor the scheduler is built yet, so this endpoint stops at the
-    decision (which is the agent's whole job)."""
-    campaign = _get_campaign(campaign_id)
-    link = _get_link(link_id)
-    prospect = _prospects.get(link.prospect_id)
-    if prospect is None:
-        raise HTTPException(404, f"Prospect {link.prospect_id} not found")
+async def run_personalize(campaign_id: str, link_id: str, session: AsyncSession = Depends(get_session)) -> dict:
+    """Runs Personalize on a qualified prospect. Returns a draft + channel +
+    timing decision. Does NOT send (connector) or schedule (APScheduler) — those
+    aren't built yet; this stops at the decision, which is the agent's whole job.
+    Refuses prospects on the suppression list."""
+    campaign = await _require_campaign(session, campaign_id)
+    link = await _require_link(session, link_id)
+    prospect = await _require_prospect(session, link.prospect_id)
     if link.stage != FunnelStage.QUALIFIED:
         raise HTTPException(409, f"Prospect is at stage '{link.stage}', must be 'qualified' to personalize")
 
-    campaign_personas = [p for p in _personas.values() if p.campaign_id == campaign_id]
-    campaign_assets = [a for a in _assets.values() if a.campaign_id == campaign_id]
+    # Do-not-contact guard.
+    for key in (prospect.profile.linkedin_url, prospect.profile.work_email, prospect.profile.name):
+        if key and await repo.is_suppressed(session, key):
+            raise HTTPException(409, "Prospect is on the do-not-contact suppression list")
 
-    agent = PersonalizeAgent(assets=campaign_assets)
-    context = AgentContext(campaign=campaign, prospect=prospect, link=link, personas=campaign_personas)
+    personas = await repo.list_personas_for_campaign(session, campaign_id)
+    assets = await repo.list_assets_for_campaign(session, campaign_id)
+
+    agent = PersonalizeAgent(assets=assets)
+    context = AgentContext(campaign=campaign, prospect=prospect, link=link, personas=personas)
     decision = agent.run(context)
-    _decisions.append(decision)
-
+    await repo.append_decision(session, decision)
     return {"decision": decision}
 
 
 # --- converse agent invocation -----------------------------------------------
-class ConverseRequest(BaseModel):
-    inbound_message: Optional[str] = None
-    trigger: str = "reply"                 # "reply" | "follow_up"
-    channel: Channel = Channel.EMAIL
-
-
 @router.post("/{campaign_id}/prospects/{link_id}/converse")
-def run_converse(campaign_id: str, link_id: str, body: ConverseRequest) -> dict:
-    """Handle an inbound reply (from a channel connector, later) or a fired
-    follow-up timer (from APScheduler, later). Today the inbound message is
-    passed in the request body so it's testable without a live inbox.
+async def run_converse(campaign_id: str, link_id: str, body: ConverseRequest, session: AsyncSession = Depends(get_session)) -> dict:
+    """Handle an inbound reply (from a channel connector later) or a manually
+    triggered follow-up. Delegates to the shared service layer so the scheduler
+    runs the identical logic when a follow-up timer fires."""
+    campaign = await _require_campaign(session, campaign_id)
+    link = await _require_link(session, link_id)
+    prospect = await _require_prospect(session, link.prospect_id)
 
-    Applies the returned decision: records the inbound turn, transitions stage,
-    suppresses on unsubscribe, and — when a reply is needed — re-invokes the
-    Personalize agent (all drafting lives there)."""
-    campaign = _get_campaign(campaign_id)
-    link = _get_link(link_id)
-    prospect = _prospects.get(link.prospect_id)
-    if prospect is None:
-        raise HTTPException(404, f"Prospect {link.prospect_id} not found")
-
-    campaign_personas = [p for p in _personas.values() if p.campaign_id == campaign_id]
-    history = [t for t in _conversations if t.campaign_id == campaign_id and t.prospect_id == link.prospect_id]
-
-    # Record the inbound reply as a conversation turn.
-    if body.trigger == "reply" and body.inbound_message:
-        _conversations.append(ConversationTurn(
-            campaign_id=campaign_id, prospect_id=link.prospect_id,
-            channel=body.channel, direction=Direction.INBOUND, content=body.inbound_message,
-        ))
-
-    context = AgentContext(
-        campaign=campaign, prospect=prospect, link=link, personas=campaign_personas,
-        trigger=body.trigger, inbound_message=body.inbound_message, conversation_history=history,
+    return await service.process_converse(
+        session, campaign, link, prospect,
+        trigger=body.trigger, inbound_message=body.inbound_message, channel=body.channel,
     )
-    decision = converse_agent.run(context)
-    _decisions.append(decision)
 
-    # --- orchestrator executes the decision ---
-    follow_up_draft = None
 
-    if decision.details.get("suppress"):
-        suppression.add_prospect(prospect)
+class ScheduleFollowUpRequest(BaseModel):
+    delay_days: int = 3
 
-    target_stage = decision.details.get("target_stage")
-    if target_stage:
-        try:
-            sm.transition(link, FunnelStage(target_stage), campaign)
-        except (sm.InvalidTransitionError, sm.CampaignNotLiveError):
-            pass  # keep current stage if the transition isn't valid from here
 
-    # Loop-back: when a reply/follow-up message is needed, re-invoke Personalize.
-    next_action = decision.details.get("next_action")
-    if next_action in ("reply", "follow_up") and link.stage == FunnelStage.ENGAGED:
-        campaign_assets = [a for a in _assets.values() if a.campaign_id == campaign_id]
-        p_agent = PersonalizeAgent(assets=campaign_assets)
-        p_decision = p_agent.run(context)
-        _decisions.append(p_decision)
-        follow_up_draft = p_decision
+@router.post("/{campaign_id}/prospects/{link_id}/schedule-follow-up")
+async def schedule_follow_up(campaign_id: str, link_id: str, body: ScheduleFollowUpRequest, session: AsyncSession = Depends(get_session)) -> dict:
+    """Schedule a follow-up timer for a contacted prospect. When it fires, the
+    scheduler runs the same converse follow-up path via the service layer.
+    Working-hours-aware; respects pause (parks + fires on resume)."""
+    campaign = await _require_campaign(session, campaign_id)
+    link = await _require_link(session, link_id)
 
-    return {"decision": decision, "personalize_followup": follow_up_draft}
+    fire_at = sched.schedule_follow_up(campaign, link_id, delay_days=body.delay_days)
+    link.next_follow_up_at = fire_at
+    await repo.save_link(session, link)
+    return {"scheduled_for": fire_at, "link_id": link_id}
 
 
 # --- suppression / do-not-contact --------------------------------------------
 @router.get("/suppression/list")
-def get_suppression_list() -> dict:
-    return {"suppressed": suppression.all()}
+async def get_suppression_list(session: AsyncSession = Depends(get_session)) -> dict:
+    return {"suppressed": await repo.list_suppression(session)}
 
 
 @router.post("/suppression/add")
-def add_to_suppression(value: str) -> dict:
-    suppression.add(value)
+async def add_to_suppression(value: str, session: AsyncSession = Depends(get_session)) -> dict:
+    await repo.add_suppression(session, value)
     return {"added": value}

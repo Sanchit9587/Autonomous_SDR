@@ -76,6 +76,10 @@ def decide_on_follow_up(
                              f"max follow-ups ({policy.max_attempts}) reached — stopping")
 
     if last_contact_at is not None:
+        # A datetime loaded from the DB may be timezone-naive; assume UTC so the
+        # subtraction below never mixes naive and aware datetimes.
+        if last_contact_at.tzinfo is None:
+            last_contact_at = last_contact_at.replace(tzinfo=timezone.utc)
         days_since = (now - last_contact_at).days
         if days_since < policy.min_days_between:
             return PolicyOutcome(DecisionVerdict.WAIT, "none", None,

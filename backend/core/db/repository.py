@@ -76,6 +76,17 @@ async def list_all_links(session: AsyncSession) -> list[CampaignProspectLink]:
     return [mp.link_to_model(r) for r in rows]
 
 
+async def list_owed_follow_up_links(session: AsyncSession, campaign_id: str) -> list[CampaignProspectLink]:
+    """Links whose follow-up fired while the campaign was paused (owed on resume)."""
+    rows = (await session.execute(
+        select(t.CampaignProspectLinkORM).where(
+            t.CampaignProspectLinkORM.campaign_id == campaign_id,
+            t.CampaignProspectLinkORM.follow_up_owed == True,  # noqa: E712
+        )
+    )).scalars().all()
+    return [mp.link_to_model(r) for r in rows]
+
+
 # --- personas ---------------------------------------------------------------
 async def save_persona(session: AsyncSession, persona: Persona) -> Persona:
     await session.merge(mp.persona_to_orm(persona))
@@ -145,3 +156,32 @@ async def list_suppression(session: AsyncSession) -> list[str]:
 async def is_suppressed(session: AsyncSession, key: str) -> bool:
     row = await session.get(t.SuppressionEntryORM, key.strip().lower())
     return row is not None
+
+
+# --- users ------------------------------------------------------------------
+async def save_user(session: AsyncSession, user) -> None:
+    """Accepts a UserInDB (carries the hash)."""
+    from core.db import mappers as _mp
+    await session.merge(_mp.user_to_orm(user))
+
+
+async def get_user_by_email(session: AsyncSession, email: str):
+    """Returns UserInDB (with hash) for auth, or None."""
+    from core.db import mappers as _mp
+    row = (await session.execute(
+        select(t.UserORM).where(t.UserORM.email == email.strip().lower())
+    )).scalar_one_or_none()
+    return _mp.user_to_indb(row) if row else None
+
+
+async def get_user(session: AsyncSession, user_id: str):
+    """Returns public User (no hash), or None."""
+    from core.db import mappers as _mp
+    row = await session.get(t.UserORM, user_id)
+    return _mp.user_to_model(row) if row else None
+
+
+async def list_users(session: AsyncSession):
+    from core.db import mappers as _mp
+    rows = (await session.execute(select(t.UserORM))).scalars().all()
+    return [_mp.user_to_model(r) for r in rows]

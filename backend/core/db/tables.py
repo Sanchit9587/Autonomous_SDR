@@ -34,6 +34,7 @@ class CampaignORM(TimestampMixin, Base):
     id: Mapped[str] = mapped_column(String, primary_key=True)
     name: Mapped[str] = mapped_column(String, nullable=False)
     description: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    vision_statement: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     owner: Mapped[str] = mapped_column(String, nullable=False)
     status: Mapped[str] = mapped_column(String, nullable=False, default="draft")
 
@@ -41,6 +42,16 @@ class CampaignORM(TimestampMixin, Base):
     agent_settings: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     channel_policies: Mapped[list] = mapped_column(JSON, default=list)
     default_channel_priority: Mapped[list] = mapped_column(JSON, default=list)
+
+    budget: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    start_date: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    end_date: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    target_scale: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    pace_per_day: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    goals: Mapped[list] = mapped_column(JSON, default=list)
+    sources: Mapped[list] = mapped_column(JSON, default=list)
+    connector_configs: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+
     system_prompt_version: Mapped[Optional[str]] = mapped_column(String, nullable=True)
     assigned_rep_ids: Mapped[list] = mapped_column(JSON, default=list)
 
@@ -66,6 +77,8 @@ class CampaignProspectLinkORM(TimestampMixin, Base):
     human_approved_by: Mapped[Optional[str]] = mapped_column(String, nullable=True)
     last_contacted_channel: Mapped[Optional[str]] = mapped_column(String, nullable=True)
     contact_count: Mapped[int] = mapped_column(Integer, default=0)
+    follow_up_owed: Mapped[bool] = mapped_column(Boolean, default=False)
+    next_follow_up_at: Mapped[Optional[str]] = mapped_column(String, nullable=True)
 
 
 class PersonaORM(TimestampMixin, Base):
@@ -147,3 +160,15 @@ class SuppressionEntryORM(Base):
 
     key: Mapped[str] = mapped_column(String, primary_key=True)  # normalised identifier
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+
+
+class UserORM(TimestampMixin, Base):
+    __tablename__ = "users"
+
+    id: Mapped[str] = mapped_column(String, primary_key=True)
+    email: Mapped[str] = mapped_column(String, unique=True, index=True, nullable=False)
+    full_name: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    title: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    role: Mapped[str] = mapped_column(String, nullable=False, default="rep")
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+    hashed_password: Mapped[str] = mapped_column(String, nullable=False)

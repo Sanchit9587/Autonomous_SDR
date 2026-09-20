@@ -6,7 +6,7 @@ python-dotenv>=1.0
 # NOTE: 'asyncio' is part of the Python standard library (3.4+). Do NOT pip install it —
 # the PyPI 'asyncio' package is an obsolete backport that breaks modern installs.
 
-# Optional: only needed to receive Apollo async phone-number webhooks
+# API server (the whole orchestrator API runs on FastAPI; uvicorn serves it)
 fastapi>=0.110
 uvicorn>=0.29
 
@@ -21,8 +21,16 @@ numpy>=1.26
 # Database: Prisma Postgres via SQLAlchemy (async runtime + Alembic migrations)
 sqlalchemy[asyncio]>=2.0
 asyncpg>=0.29         # async driver, used by the running app (pooled DATABASE_URL)
-psycopg2-binary>=2.9  # sync driver, used by Alembic migrations (DIRECT_URL)
+psycopg2-binary>=2.9  # sync driver, used by Alembic migrations AND the APScheduler jobstore (DIRECT_URL)
 alembic>=1.13
+
+# Scheduler: follow-up timers with a persistent (Postgres) job store
+apscheduler>=3.10,<4.0
+
+# Auth: JWT + password hashing + email validation
+pyjwt>=2.8
+bcrypt>=4.1
+email-validator>=2.1   # required by pydantic EmailStr
 
 # Testing
 pytest>=8.0

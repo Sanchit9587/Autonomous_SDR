@@ -53,3 +53,11 @@ class CampaignProspectLink(TimestampedModel):
 
     last_contacted_channel: Optional[str] = None
     contact_count: int = 0
+
+    # Follow-up scheduling state (used by the scheduler):
+    # - follow_up_owed: a follow-up timer fired while the campaign was paused, so
+    #   it's owed and must fire on resume (now or next working window).
+    # - next_follow_up_at: ISO UTC timestamp of the currently scheduled follow-up,
+    #   if any (informational / for the dashboard).
+    follow_up_owed: bool = False
+    next_follow_up_at: Optional[str] = None

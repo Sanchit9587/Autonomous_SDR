@@ -8,7 +8,7 @@ from typing import Optional
 
 from pydantic import BaseModel, Field
 
-from core.models.base import CampaignStatus, Channel, TimestampedModel, _new_id
+from core.models.base import CampaignStatus, Channel, ChannelMode, TimestampedModel, _new_id
 
 
 class ICPFilter(BaseModel):
@@ -18,6 +18,8 @@ class ICPFilter(BaseModel):
     target_roles: list[str] = Field(default_factory=list)
     geography: list[str] = Field(default_factory=list)
     company_criteria: Optional[str] = None       # free text: size, industry, funding stage etc.
+    company_size_min: Optional[int] = None        # e.g. 50  (Config "50-500")
+    company_size_max: Optional[int] = None        # e.g. 500
     exclusion_criteria: Optional[str] = None
     sample_profile_urls: list[str] = Field(default_factory=list)   # reference "good fit" profiles
 
@@ -33,18 +35,21 @@ class AgentSettings(BaseModel):
 
 
 class ChannelPolicy(BaseModel):
-    """Per-channel operating limits for a campaign."""
+    """Per-channel operating limits + execution mode for a campaign."""
 
     channel: Channel
     enabled: bool = True
+    mode: ChannelMode = ChannelMode.APPROVAL     # automate / approval / manual
     daily_limit: Optional[int] = None
     working_hours: Optional[str] = None            # e.g. "09:00-18:00 IST"
+    cpm: Optional[float] = None                    # cost-per-mille, for budget/metrics
 
 
 class Campaign(TimestampedModel):
     id: str = Field(default_factory=lambda: _new_id("camp"))
     name: str
     description: Optional[str] = None
+    vision_statement: Optional[str] = None         # Config "Campaign Vision Statement"
     owner: str                                      # rep/user id
     status: CampaignStatus = CampaignStatus.DRAFT
 
@@ -54,6 +59,16 @@ class Campaign(TimestampedModel):
     # Fallback channel order when a prospect's persona doesn't specify its own
     # (see Persona.effective_channel_priority).
     default_channel_priority: list[Channel] = Field(default_factory=list)
+
+    # Strategy / execution config (Campaign Config + Summary screens):
+    budget: Optional[float] = None
+    start_date: Optional[str] = None               # ISO date
+    end_date: Optional[str] = None
+    target_scale: Optional[int] = None             # target prospects/impressions
+    pace_per_day: Optional[int] = None             # touches/day
+    goals: list[str] = Field(default_factory=list) # e.g. ["book_meeting", "signup"]
+    sources: list[str] = Field(default_factory=lambda: ["apollo", "linkedin"]) # Apollo, LinkedIn, CSV
+    connector_configs: dict[str, dict] = Field(default_factory=dict)            # per-connector config/status
 
     system_prompt_version: Optional[str] = None      # campaign-level PromptVersion.id
     assigned_rep_ids: list[str] = Field(default_factory=list)
