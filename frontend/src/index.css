@@ -1,7 +1,19 @@
 @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
 
 * { box-sizing: border-box; }
-html, body, #root { margin: 0; padding: 0; min-height: 100%; }
+
+/* Root chain must explicitly fill the viewport, or the app collapses to content
+   width on some browsers/OSes (boxed on Linux, fine on Windows). */
+html, body { height: 100%; width: 100%; margin: 0; padding: 0; }
+#root {
+  width: 100%;
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+  overflow-x: hidden;           /* never scroll sideways */
+}
+#root > * { flex: 1 0 auto; width: 100%; }
+
 body { background: #120b18; font-family: 'Inter', system-ui, sans-serif; }
 a { color: inherit; }
 select option { color: #fff; }

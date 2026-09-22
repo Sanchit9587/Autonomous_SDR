@@ -2,10 +2,12 @@ import { useEffect, useState } from "react";
 import { repApi, type CampaignOverview } from "../../api/rep";
 import type { Campaign, FunnelStage } from "../../types";
 import { RepCard, repTheme as t } from "../../components/RepLayout";
+import { useIsMobile } from "../../hooks";
 
 const FUNNEL_ORDER: FunnelStage[] = ["discovered", "researched", "qualified", "contacted", "engaged", "meeting", "opportunity"];
 
 export function RepDashboard() {
+  const isMobile = useIsMobile();
   const [campaigns, setCampaigns] = useState<Campaign[]>([]);
   const [selected, setSelected] = useState<string>("");
   const [overview, setOverview] = useState<CampaignOverview | null>(null);
@@ -27,7 +29,7 @@ export function RepDashboard() {
   const top = funnel ? Math.max(funnel.discovered || 1, 1) : 1;
 
   return (
-    <div style={{ maxWidth: 920 }}>
+    <div style={{ width: "100%" }}>
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 16, flexWrap: "wrap", gap: 10 }}>
         <h1 style={{ color: "#0f4a44", fontSize: 20, fontWeight: 700, margin: 0 }}>
           {overview?.campaign.name ?? "Dashboard"}
@@ -43,7 +45,7 @@ export function RepDashboard() {
 
       {overview && (
         <>
-          <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 14, marginBottom: 16 }}>
+          <div style={{ display: "grid", gridTemplateColumns: isMobile ? "1fr" : "repeat(3, 1fr)", gap: 14, marginBottom: 16 }}>
             <StatCard icon="⚠" label="Escalations" value={String(overview.open_escalations)} tint="rgba(220,38,38,0.15)" />
             <StatCard icon="👥" label="Prospects" value={String(Object.values(overview.funnel).reduce((a, b) => a + b, 0))}
               sub={`${overview.funnel.qualified || 0} qualified · ${overview.funnel.engaged || 0} engaged`} tint="rgba(13,148,136,0.15)" />
@@ -51,7 +53,7 @@ export function RepDashboard() {
               sub={`${overview.funnel.opportunity || 0} opportunities`} tint="rgba(3,105,161,0.15)" />
           </div>
 
-          <div style={{ display: "grid", gridTemplateColumns: "1.3fr 1fr", gap: 14 }}>
+          <div style={{ display: "grid", gridTemplateColumns: isMobile ? "1fr" : "1.3fr 1fr", gap: 14 }}>
             <RepCard>
               <div style={{ color: t.text, fontSize: 13, fontWeight: 700, marginBottom: 12 }}>Prospect funnel</div>
               <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
