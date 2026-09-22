@@ -9,7 +9,7 @@ const NEXT_ACTIONS: Record<CampaignStatus, { label: string; fn: keyof typeof cam
   draft: [{ label: "Activate", fn: "activate" }],
   live: [{ label: "Pause", fn: "pause" }, { label: "Complete", fn: "complete" }],
   paused: [{ label: "Resume", fn: "resume" }, { label: "Complete", fn: "complete" }],
-  completed: [{ label: "Archive", fn: "archive" }],
+  completed: [],
   archived: [],
 };
 
@@ -23,7 +23,9 @@ export function Campaigns() {
     setLoading(true);
     campaignsApi
       .list()
-      .then(setCampaigns)
+      // Hide archived campaigns from the active list — "killing" a campaign
+      // archives it, which removes it from view while keeping its data.
+      .then((all) => setCampaigns(all.filter((c) => c.status !== "archived")))
       .catch((e) => setError(String(e.message ?? e)))
       .finally(() => setLoading(false));
   };
@@ -33,6 +35,23 @@ export function Campaigns() {
     try {
       // @ts-expect-error dynamic lifecycle call — all take a single id
       await campaignsApi[fn](id);
+      load();
+    } catch (e) {
+      setError(String((e as Error).message));
+    }
+  };
+
+  const killCampaign = async (c: Campaign) => {
+    if (!window.confirm(`Kill campaign "${c.name}"?\n\nIt will be archived and removed from this list. Its data is kept but it stops appearing here. This can be undone by an admin via the API.`)) {
+      return;
+    }
+    try {
+      // The state machine won't archive a LIVE campaign directly — pause first,
+      // then archive. Draft/paused/completed can archive straight away.
+      if (c.status === "live") {
+        await campaignsApi.pause(c.id);
+      }
+      await campaignsApi.archive(c.id);
       load();
     } catch (e) {
       setError(String((e as Error).message));
@@ -68,6 +87,7 @@ export function Campaigns() {
                     <Button key={a.label} variant="primary" onClick={() => runAction(c.id, a.fn)}>{a.label}</Button>
                   ))}
                   <Button onClick={() => runAction(c.id, "duplicate")}>Duplicate</Button>
+                  <Button variant="danger" onClick={() => killCampaign(c)}>🗑 Kill</Button>
                 </div>
               </div>
               <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 16, marginTop: 14, borderTop: `1px solid ${theme.border}`, paddingTop: 12 }}>

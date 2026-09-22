@@ -1,6 +1,7 @@
-import type { ReactNode } from "react";
+import { useState, type ReactNode } from "react";
 import { NavLink, useNavigate } from "react-router-dom";
 import { useAuth } from "../context/AuthContext";
+import { useIsMobile } from "../hooks";
 
 // Rep app uses the light/teal palette from the Mark Anders mockups, distinct
 // from the manager control plane's dark purple.
@@ -17,6 +18,8 @@ const teal = {
 
 export const repTheme = teal;
 
+const MAX_CONTENT = 1400;
+
 const NAV = [
   { to: "/rep", label: "Dashboard", icon: "📊", end: true },
   { to: "/rep/activity", label: "Live Activity", icon: "⚡", end: false },
@@ -24,43 +27,97 @@ const NAV = [
   { to: "/rep/escalations", label: "Escalations", icon: "🚨", end: false },
 ];
 
-function RepSidebar() {
-  const { user, logout } = useAuth();
-  const navigate = useNavigate();
-  const initials = (user?.full_name ?? user?.email ?? "?").split(" ").map((s) => s[0]).slice(0, 2).join("").toUpperCase();
+function initialsOf(name: string) {
+  return name.split(" ").map((s) => s[0]).slice(0, 2).join("").toUpperCase();
+}
 
+function NavItems({ onNavigate }: { onNavigate?: () => void }) {
   return (
-    <div style={{ width: 160, background: "#fff", borderRight: "1px solid #e5e7eb", padding: "16px 12px", display: "flex", flexDirection: "column", gap: 22, minHeight: "100vh", flexShrink: 0 }}>
-      <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-        <div style={{ width: 26, height: 26, borderRadius: "50%", background: teal.primary, display: "flex", alignItems: "center", justifyContent: "center", color: "#fff", fontSize: 10, fontWeight: 700 }}>{initials}</div>
-        <div>
-          <div style={{ color: teal.text, fontSize: 11, fontWeight: 600 }}>{user?.full_name ?? user?.email}</div>
-          <div style={{ color: "#6b7280", fontSize: 8 }}>{user?.title ?? user?.role}</div>
-        </div>
+    <>
+      {NAV.map((n) => (
+        <NavLink key={n.to} to={n.to} end={n.end} onClick={onNavigate} style={({ isActive }) => ({
+          color: isActive ? teal.primary : "#374151", fontWeight: isActive ? 600 : 400,
+          fontSize: 12, textDecoration: "none", display: "flex", alignItems: "center", gap: 8, padding: "8px 6px",
+        })}>{n.icon} {n.label}</NavLink>
+      ))}
+    </>
+  );
+}
+
+function UserChip() {
+  const { user } = useAuth();
+  return (
+    <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+      <div style={{ width: 26, height: 26, borderRadius: "50%", background: teal.primary, display: "flex", alignItems: "center", justifyContent: "center", color: "#fff", fontSize: 10, fontWeight: 700, flexShrink: 0 }}>{initialsOf(user?.full_name ?? user?.email ?? "?")}</div>
+      <div style={{ minWidth: 0 }}>
+        <div style={{ color: teal.text, fontSize: 11, fontWeight: 600, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{user?.full_name ?? user?.email}</div>
+        <div style={{ color: "#6b7280", fontSize: 8 }}>{user?.title ?? user?.role}</div>
       </div>
-      <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+    </div>
+  );
+}
+
+function LogoutLink({ onNavigate }: { onNavigate?: () => void }) {
+  const { logout } = useAuth();
+  const navigate = useNavigate();
+  return (
+    <div onClick={() => { onNavigate?.(); logout(); navigate("/login"); }} style={{ color: "#ef4444", fontSize: 11, cursor: "pointer" }}>⏻ Logout</div>
+  );
+}
+
+function DesktopSidebar() {
+  return (
+    <div style={{ width: 170, background: "#fff", borderRight: "1px solid #e5e7eb", padding: "16px 12px", display: "flex", flexDirection: "column", gap: 20, minHeight: "100vh", flexShrink: 0 }}>
+      <UserChip />
+      <div style={{ display: "flex", flexDirection: "column", gap: 4, flex: 1 }}>
         <div style={{ color: teal.primary, fontSize: 8, fontWeight: 700, textTransform: "uppercase", letterSpacing: "0.05em" }}>Workspace</div>
-        {NAV.map((n) => (
-          <NavLink key={n.to} to={n.to} end={n.end} style={({ isActive }) => ({
-            color: isActive ? teal.primary : "#374151", fontWeight: isActive ? 600 : 400,
-            fontSize: 11, textDecoration: "none", display: "flex", alignItems: "center", gap: 6,
-          })}>{n.icon} {n.label}</NavLink>
-        ))}
+        <NavItems />
       </div>
-      <div style={{ flex: 1 }} />
       <div>
         <div style={{ color: teal.primary, fontSize: 8, fontWeight: 700, textTransform: "uppercase", marginBottom: 8 }}>Account</div>
-        <div onClick={() => { logout(); navigate("/login"); }} style={{ color: "#ef4444", fontSize: 10, cursor: "pointer" }}>⏻ Logout</div>
+        <LogoutLink />
       </div>
     </div>
   );
 }
 
 export function RepLayout({ children }: { children: ReactNode }) {
+  const isMobile = useIsMobile();
+  const [menuOpen, setMenuOpen] = useState(false);
+
+  const contentWrapper = (
+    <div style={{ width: "100%", maxWidth: MAX_CONTENT, margin: "0 auto" }}>{children}</div>
+  );
+
+  if (isMobile) {
+    return (
+      <div style={{ display: "flex", flexDirection: "column", width: "100%", minHeight: "100vh", fontFamily: teal.font, background: "#fff" }}>
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "12px 16px", background: "#fff", borderBottom: "1px solid #e5e7eb", position: "sticky", top: 0, zIndex: 20 }}>
+          <UserChip />
+          <button onClick={() => setMenuOpen((v) => !v)} aria-label="Menu"
+            style={{ background: "rgba(13,148,136,0.1)", border: "1px solid rgba(13,148,136,0.3)", color: teal.primary, borderRadius: 8, padding: "8px 12px", fontSize: 16, cursor: "pointer", lineHeight: 1 }}>
+            {menuOpen ? "\u2715" : "\u2630"}
+          </button>
+        </div>
+
+        {menuOpen && (
+          <div style={{ background: "#fff", padding: "10px 14px", display: "flex", flexDirection: "column", gap: 6, borderBottom: "1px solid #e5e7eb" }}>
+            <NavItems onNavigate={() => setMenuOpen(false)} />
+            <div style={{ marginTop: 6, paddingTop: 8, borderTop: "1px solid #e5e7eb" }}>
+              <LogoutLink onNavigate={() => setMenuOpen(false)} />
+            </div>
+          </div>
+        )}
+
+        <div style={{ flex: 1, padding: "16px", background: teal.bgGradient }}>{contentWrapper}</div>
+      </div>
+    );
+  }
+
   return (
     <div style={{ display: "flex", width: "100%", minHeight: "100vh", fontFamily: teal.font, background: "#fff" }}>
-      <RepSidebar />
-      <div style={{ flex: 1, padding: "24px 28px", background: teal.bgGradient, overflowX: "hidden" }}>{children}</div>
+      <DesktopSidebar />
+      <div style={{ flex: 1, padding: "24px 28px", background: teal.bgGradient, overflowX: "hidden" }}>{contentWrapper}</div>
     </div>
   );
 }
